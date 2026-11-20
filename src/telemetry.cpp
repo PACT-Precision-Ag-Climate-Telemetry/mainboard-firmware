@@ -37,7 +37,7 @@ uint16_t scaleU16x100(float v, float maxValue) {  // percent -> 0..100.00
 }
 int32_t scaleCoord(double deg) { return (int32_t)llround(deg * 10000000.0); }
 
-size_t bodySize(bool raw) { return 19 + (raw ? 4 : 0); }
+size_t bodySize(bool raw) { return 21 + (raw ? 4 : 0); }
 
 void putBody(uint8_t *b, size_t &o, const Reading &r, bool raw) {
   putI16(b, o, scaleI16x100(r.temperatureC));
@@ -49,6 +49,7 @@ void putBody(uint8_t *b, size_t &o, const Reading &r, bool raw) {
   putU16(b, o, scaleU16x100(r.moisturePct, 100.0f));
   putU16(b, o, scaleU16x100(r.batteryPct, 100.0f));
   putU16(b, o, r.batteryMv);
+  putI16(b, o, scaleI16x100(r.espTemperatureC));
   if (raw) {
     putU16(b, o, r.methaneRaw);
     putU16(b, o, r.moistureRaw);
@@ -72,8 +73,8 @@ uint16_t currentOffsetMm() {
 }
 
 size_t frameSize(uint8_t count, bool raw, bool gps, bool cell) {
-  // 22 + (2 + body) * count + gps + cell   (docs/telemetry.md section 4)
-  return 22 + (2 + bodySize(raw)) * count + (gps ? GPS_BLOCK_SIZE : 0) +
+  // 24 + (2 + body) * count + gps + cell   (docs/telemetry.md section 4)
+  return 24 + (2 + bodySize(raw)) * count + (gps ? GPS_BLOCK_SIZE : 0) +
          (cell ? CELL_BLOCK_SIZE : 0);
 }
 
@@ -130,6 +131,10 @@ size_t build(const Reading *readings, uint8_t count, const Location &loc,
     putU16(out, o, loc.mcc);
     putU16(out, o, loc.mnc);
   }
+
+  // -- trailer (2 B), always last
+  putU8(out, o, (uint8_t)loc.signalDbm);
+  putU8(out, o, loc.resetReason);
 
   return (o == total) ? o : 0;  // sanity: must match the documented length
 }

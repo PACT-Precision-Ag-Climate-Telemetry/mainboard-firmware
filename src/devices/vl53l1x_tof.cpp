@@ -4,6 +4,10 @@ bool VL53L1XTof::init() {
   _sensor.setBus(&Wire);
   _sensor.setTimeout(500);
   if (!_sensor.init()) return false;
+  // Narrowest field of view (4x4 SPADs, the minimum) aimed at the array centre
+  // (SPAD 199), so only the spot straight ahead is measured.
+  _sensor.setROISize(4, 4);
+  _sensor.setROICenter(199);
   _sensor.setDistanceMode(VL53L1X::Long);
   _sensor.setMeasurementTimingBudget(50000);  // 50 ms
   _sensor.startContinuous(50);

@@ -66,7 +66,9 @@ constexpr uint32_t MODEM_REGISTER_TIMEOUT_MS = 60000;  // give up waiting for th
 constexpr uint32_t MODEM_REGISTER_POLL_MS = 2000;  // between registration checks
 constexpr uint32_t MODEM_SHUTDOWN_WAIT_MS = 3000;  // for AT+CPOF to answer
 constexpr uint32_t MODEM_RAW_TIMEOUT_MS = 5000;    // console "at" command
-constexpr uint32_t MODEM_SESSION_PERIOD_MS = 120000;  // wake to send. Bench value; field: 5-120 min
+constexpr uint32_t MODEM_SESSION_PERIOD_MS = 30UL * 60 * 1000;  // wake and upload every 30 min (6 readings per frame)
+constexpr uint32_t MODEM_RETRY_BASE_MS = 60UL * 1000;  // after a failed upload retry in 1 min, then 2, 4, 8 ... capped at the session period
+constexpr uint32_t WDT_TIMEOUT_S = 60;  // hardware watchdog: reset if loop() stops running for this long
 
 // ---- Firmware ----------------------------------------------------------------
 constexpr const char *FW_VERSION = "0.1.0";
@@ -93,7 +95,29 @@ constexpr const char *DEFAULT_APN = "";
 
 // ---- Telemetry ---------------------------------------------------------------
 constexpr uint8_t TELEMETRY_MAX_READINGS = 24;       // max records per frame
-constexpr uint32_t TELEMETRY_SAMPLE_PERIOD_MS = 30000;  // bench value; field: 5 min
+constexpr uint16_t BACKLOG_MAX_READINGS = 2016;   // unsent readings kept in flash (7 days at 5 min); oldest dropped beyond this
+constexpr uint32_t TELEMETRY_SAMPLE_PERIOD_MS = 5UL * 60 * 1000;  // one reading every 5 min
+// Dev mode (console: "set DEV_MODE 1"): faster timing for bench work. Not saved,
+// so a reset returns to normal timing unless DEV_MODE_DEFAULT is true.
+constexpr bool DEV_MODE_DEFAULT = false;
+constexpr uint32_t DEV_SAMPLE_PERIOD_MS = 1UL * 60 * 1000;   // one reading per minute
+constexpr uint32_t DEV_SESSION_PERIOD_MS = 5UL * 60 * 1000;  // upload every 5 min
+// Status NeoPixel, used only in dev mode. DevKitC-1 v1.0 has it on GPIO48, v1.1 on GPIO38;
+// the board package defines RGB_BUILTIN for the one it targets.
+#ifdef RGB_BUILTIN
+constexpr int DEV_LED_PIN = RGB_BUILTIN;
+#else
+constexpr int DEV_LED_PIN = 48;
+#endif
+constexpr uint8_t DEV_LED_LEVEL = 24;  // 0-255 brightness of each colour (kept low)
+// Battery saver: when the battery is low, read and upload less often (both
+// periods are multiplied). Hysteresis stops flapping around a threshold. With no
+// fresh battery reading the normal timing is used.
+constexpr float BATT_LOW_PERCENT = 30.0f;       // below this: LOW
+constexpr float BATT_CRITICAL_PERCENT = 15.0f;  // below this: CRITICAL
+constexpr float BATT_RECOVER_MARGIN = 3.0f;     // must rise this far above a threshold to leave the level
+constexpr uint8_t BATT_LOW_SLOWDOWN = 2;        // x2: 10 min readings, 60 min uploads
+constexpr uint8_t BATT_CRITICAL_SLOWDOWN = 4;   // x4: 20 min readings, 120 min uploads
 constexpr float METHANE_PPM_PER_LEL_PERCENT = 500.0f;   // LEL = 5 % vol = 50,000 ppm
 
 // ADS1115 channels (copied from the old firmware; CONFIRM against the board).

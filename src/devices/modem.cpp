@@ -34,10 +34,25 @@ bool Modem::requestRaw(const String &cmd) {
 }
 
 // ---- command engine (non-blocking) -------------------------------------------
-void Modem::startCmd(const String &cmd, uint32_t timeoutMs) {
+void Modem::startCmd(const String &cmd, uint32_t timeoutMs, const char *expect, size_t extra) {
   while (_port.available()) _port.read();  // drop stale bytes
-  _port.print(cmd);
-  _port.print("\r\n");
+  if (cmd.length()) {                      // empty cmd = just wait for `expect`
+    _port.print(cmd);
+    _port.print("\r\n");
+  }
+  _expect = expect;
+  _expectExtra = extra;
+  _resp = "";
+  _cmdT0 = millis();
+  _cmdTimeout = timeoutMs;
+  _cmdActive = true;
+}
+
+void Modem::startData(const uint8_t *d, size_t n, uint32_t timeoutMs, const char *expect) {
+  while (_port.available()) _port.read();
+  _port.write(d, n);  // raw bytes, no line ending
+  _expect = expect;
+  _expectExtra = 0;
   _resp = "";
   _cmdT0 = millis();
   _cmdTimeout = timeoutMs;
@@ -48,7 +63,13 @@ int Modem::cmdPoll() {
   if (!_cmdActive) return -1;
   while (_port.available() && _resp.length() < MAX_RESPONSE) _resp += (char)_port.read();
 
-  if (_resp.indexOf("\r\nOK\r\n") >= 0 || _resp.startsWith("OK\r\n")) {
+  if (_expect.length()) {
+    int i = _resp.indexOf(_expect);
+    if (i >= 0 && _resp.length() >= (unsigned)i + _expect.length() + _expectExtra) {
+      _cmdActive = false;
+      return 1;
+    }
+  } else if (_resp.indexOf("\r\nOK\r\n") >= 0 || _resp.startsWith("OK\r\n")) {
     _cmdActive = false;
     return 1;
   }
@@ -97,7 +118,8 @@ void Modem::failStart(const char *why, Event &ev) {
     _rawPending = false;
     if (_rawSink) _rawSink->printf("\r\n[at] ERR modem did not start (%s)\r\n", why);
   }
-  ev = Event::SESSION_FAILED;
+  ev = _sendRequested ? Event::SEND_FAILED : Event::SESSION_FAILED;
+  _sendRequested = false;
 }
 
 // ---- main state machine -----------------------------------------------------
@@ -107,7 +129,7 @@ Modem::Event Modem::service() {
 
   switch (_state) {
     case State::OFF:
-      if (_sessionRequested || _rawPending) {
+      if (_sessionRequested || _rawPending || _sendRequested) {
         _port.end();
         _port.begin(_baud, SERIAL_8N1, /*rx*/ _pinTxd, /*tx*/ _pinRxd);
         digitalWrite(_pinPwr, HIGH);  // MOSFET on: modem gets its 5 V rail
@@ -202,6 +224,12 @@ void Modem::runReady(uint32_t now, Event &ev) {
       _rawPending = false;
       _job = Job::RAW;
       startCmd(_rawCmd, cfg::MODEM_RAW_TIMEOUT_MS);
+    } else if (_sendRequested) {
+      _sendRequested = false;
+      _job = Job::SEND;
+      _sendStage = SendStage::NETOPEN;
+      _sendOk = true;
+      _cmdActive = false;
     } else if (_sessionRequested) {
       _sessionRequested = false;
       _job = Job::PULL;
@@ -228,7 +256,95 @@ void Modem::runReady(uint32_t now, Event &ev) {
     return;
   }
 
-  stepPull(now, ev);
+  if (_job == Job::SEND) stepSend(now, ev);
+  else stepPull(now, ev);
+}
+
+// ---- SEND job: one TCP upload -------------------------------------------------
+bool Modem::requestSend(const uint8_t *data, size_t len, const String &host, uint16_t port) {
+  if (data == nullptr || len == 0 || len > MAX_SEND_BYTES || host.length() == 0) return false;
+  if (_sendRequested || _job == Job::SEND) return false;
+  memcpy(_txBuf, data, len);
+  _txLen = len;
+  _sendHost = host;
+  _sendPortNo = port;
+  _sendRequested = true;
+  return true;
+}
+
+// Remember the first failure and jump to cleanup (close the socket / network).
+void Modem::sendFailed(const char *why) {
+  if (_sendOk) lastError = why;
+  _sendOk = false;
+  _sendStage = SendStage::CIPCLOSE;
+  _cmdActive = false;
+}
+
+void Modem::stepSend(uint32_t now, Event &ev) {
+  if (!_cmdActive) {
+    switch (_sendStage) {
+      case SendStage::NETOPEN:
+        if (!registered()) { sendFailed("not registered on the network"); return; }
+        startCmd("AT+NETOPEN", 20000, "+NETOPEN:");
+        break;
+      case SendStage::IPOPEN:
+        startCmd("AT+CIPOPEN=0,\"TCP\",\"" + _sendHost + "\"," + String(_sendPortNo), 30000,
+                 "+CIPOPEN:");
+        break;
+      case SendStage::IPSEND: startCmd("AT+CIPSEND=0," + String((unsigned)_txLen), 5000, ">"); break;
+      case SendStage::DATA: startData(_txBuf, _txLen, 15000, "+CIPSEND:"); break;
+      // Server ack: "+RECEIVE,0,1\r\n" followed by one byte that must be 0x00.
+      case SendStage::ACK: startCmd("", 20000, "+RECEIVE,0,1\r\n", 1); break;
+      case SendStage::CIPCLOSE: startCmd("AT+CIPCLOSE=0", 5000, "+CIPCLOSE:"); break;
+      case SendStage::NETCLOSE: startCmd("AT+NETCLOSE", 5000, "+NETCLOSE:"); break;
+    }
+    return;
+  }
+
+  int r = cmdPoll();
+  if (r == 0) return;
+
+  switch (_sendStage) {
+    case SendStage::NETOPEN:
+      // "+IP ERROR: Network is already opened" is fine too.
+      if (_resp.indexOf("+NETOPEN: 0") >= 0 || _resp.indexOf("already opened") >= 0)
+        _sendStage = SendStage::IPOPEN;
+      else sendFailed("NETOPEN failed (check APN / data plan)");
+      break;
+    case SendStage::IPOPEN:
+      if (r == 1 && _resp.indexOf("+CIPOPEN: 0,0") >= 0) _sendStage = SendStage::IPSEND;
+      else sendFailed("could not connect to the server");
+      break;
+    case SendStage::IPSEND:
+      if (r == 1) _sendStage = SendStage::DATA;
+      else sendFailed("modem refused CIPSEND");
+      break;
+    case SendStage::DATA:
+      if (r == 1 && _resp.indexOf("+CIPSEND: 0,") >= 0) _sendStage = SendStage::ACK;
+      else sendFailed("frame write failed");
+      break;
+    case SendStage::ACK: {
+      int i = _resp.indexOf("+RECEIVE,0,1\r\n");
+      if (r == 1 && i >= 0 && _resp.charAt(i + 14) == 0) {
+        _sendStage = SendStage::CIPCLOSE;  // success: _sendOk stays true
+      } else if (r == 1) {
+        sendFailed("server rejected the frame (no 0x00 ack)");
+      } else {
+        sendFailed("no ack from the server");
+      }
+      break;
+    }
+    case SendStage::CIPCLOSE: _sendStage = SendStage::NETCLOSE; break;  // result ignored
+    case SendStage::NETCLOSE:
+      _job = Job::NONE;
+      _lastActivity = now;
+      if (_sendOk) {
+        sendsOk++;
+        lastError = "";
+      }
+      ev = _sendOk ? Event::SEND_DONE : Event::SEND_FAILED;
+      break;
+  }
 }
 
 // ---- PULL session -----------------------------------------------------------

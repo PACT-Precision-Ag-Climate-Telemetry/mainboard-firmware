@@ -2,6 +2,7 @@
 
 static const uint16_t CMD_STOP_PERIODIC = 0x3F86;
 static const uint16_t CMD_START_PERIODIC = 0x21B1;
+static const uint16_t CMD_SET_ASC = 0x2416;  // automatic self-calibration on/off
 static const uint16_t CMD_GET_DATA_READY = 0xE4B8;
 static const uint16_t CMD_READ_MEASUREMENT = 0xEC05;
 static const uint32_t STOP_MS = 500;  // after stop_periodic_measurement
@@ -27,6 +28,22 @@ bool SCD40::service() {
   switch (_st) {
     case St::STOPPING:
       if (now - _t >= STOP_MS) {
+        // set_automatic_self_calibration_enabled(0). Only accepted while idle,
+        // so it goes between stop and start. Re-sent at every boot.
+        const uint8_t off[2] = {0x00, 0x00};
+        Wire.beginTransmission(_addr);
+        Wire.write(CMD_SET_ASC >> 8);
+        Wire.write(CMD_SET_ASC & 0xFF);
+        Wire.write(off, 2);
+        Wire.write(crc8(off, 2));
+        Wire.endTransmission();
+        _st = St::ASC_SET;
+        _t = now;
+      }
+      return false;
+
+    case St::ASC_SET:
+      if (now - _t >= CMD_MS) {
         writeCmd16(CMD_START_PERIODIC);
         _st = St::IDLE;
       }

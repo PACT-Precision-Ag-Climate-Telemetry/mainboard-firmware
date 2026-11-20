@@ -37,6 +37,13 @@ says so.
     every `delay()` removed from the firmware; the modem is powered only for a
     session; MCC/MNC are read from the network and put in the frame's cell
     block. J4 confirmed correctly wired by the owner.
+13. **Telemetry v2 fields and TCP sender** (sections 2.11 and 2.12): added
+    `esp_temperature` and a 2-byte trailer (signal strength, reset reason) to the
+    frame, and a modem SEND job that uploads the frame and waits for the ack.
+14. **Intervals and dev mode** (open item 10, section 2.13): 5 min / 30 min
+    normally, 1 min / 5 min with `set DEV_MODE 1`. Dev-mode status NeoPixel.
+15. **Battery saver** (section 2.14): slower reading and upload when the battery
+    is low.
 
 ## 2. Findings and decisions
 
@@ -56,7 +63,7 @@ the settings names. Differences worth knowing:
 - Old board: I2C on GPIO15/16, modem power pin GPIO21/4. New board: I2C on
   GPIO8/9, GNSS on GPIO15/16, modem power on GPIO5 plus a key pulse on GPIO4.
 - Old payload used 34/42-byte records; the new format (telemetry.md) uses
-  19-byte bodies (23 with RAW).
+  21-byte bodies (25 with RAW) since section 2.11 (it was 19/23 before).
 
 ### 2.3 Modem
 
@@ -145,7 +152,7 @@ while the battery settles, the ADC converts or the modem boots.
 
 - Old behaviour: powered at boot, kept on, polled every 10 s.
 - New: off by default. A session is requested (`modem.request()`) when a send is
-  due (`MODEM_SESSION_PERIOD_MS`, 2 min for bench use), by `set MODEM_WAKE 1`, or
+  due (`MODEM_SESSION_PERIOD_MS`, now 30 min), by `set MODEM_WAKE 1`, or
   by a console `at` command. The state machine is described in hardware.md.
 - After the work, the modem idles 5 s (`MODEM_LINGER_MS`), then `AT+CPOF`, then
   the rail is cut.
@@ -157,11 +164,8 @@ while the battery settles, the ADC converts or the modem boots.
 - **Honest limits:** `AT+CPOF`, `AT+COPS=3,2` and the whole session are
   untested on the board. The earlier run could power the modem and get `OK` to
   `AT`, but registration never happened.
-- **The send itself is still missing.** A session wakes the modem, pulls
-  status, builds the frame (with the cell block) and prints it, with the line
-  `TCP send is not implemented yet: frame NOT sent`. The old firmware's TCP path
-  (`AT+NETOPEN`, `AT+CIPOPEN`, `AT+CIPSEND` with the `>` prompt, ack via
-  `AT+CIPRXGET`, retry cache) has not been ported.
+- **The send** is described in section 2.12. (Earlier versions only printed the
+  frame with `TCP send is not implemented yet`.)
 
 ### 2.10 Cell block
 
@@ -175,6 +179,88 @@ while the battery settles, the ADC converts or the modem boots.
   in the reply and the cell block stays absent.
 - Network time (`AT+CCLK?`) is also taken in the session and used to set the
   system clock when neither GNSS nor an earlier sync has set it.
+
+### 2.11 Telemetry v2 fields
+
+- `docs/telemetry.md` was updated by the owner: the sensor body gained
+  `esp_temperature` (int16, degrees C x 100, signed, after `battery_voltage`),
+  and the frame gained a 2-byte trailer, always present and always last, after the
+  optional GPS and cell blocks: `signal_strength` (int8 dBm) and `reset_reason`
+  (uint8, `esp_reset_reason_t`). Frame length is now `24 + (2 + body) x count +
+  gps + cell`, with `body = 21` (25 with RAW).
+- Firmware: `Reading.espTemperatureC` is filled from `temperatureRead()`;
+  `Location.signalDbm` comes from the modem's CSQ (`-113 + 2 x csq`) and
+  `Location.resetReason` from `esp_reset_reason()`.
+- **Assumption:** when CSQ is 99 (unknown) `signal_strength` is sent as 0. The
+  document does not define an "unknown" value; confirm with the server side.
+- **Doc nit (open):** the `reset_reason` row in telemetry.md has `power*on`,
+  `external*pin` and `unknown*<code>`; the underscores were mangled into
+  asterisks by a formatter.
+- Not yet re-checked against the documented hex example on a PC, and the
+  worked example in telemetry.md should be checked for the new fields.
+
+### 2.12 TCP sender
+
+- New `Job::SEND` in the modem handler (non-blocking, same command engine, which
+  can now wait for a given reply such as `>` instead of only `OK`). Sequence:
+  `AT+NETOPEN` (`+NETOPEN: 0`, or "already opened"), `AT+CIPOPEN=0,"TCP",host,port`
+  (`+CIPOPEN: 0,0`), `AT+CIPSEND=0,len` (wait for `>`), the frame bytes in one
+  write (`+CIPSEND:`), then the ack, then `AT+CIPCLOSE=0` and `AT+NETCLOSE`.
+  Cleanup runs after a failure too.
+- Ack: the server's 1-byte `0x00` is read from the `+RECEIVE,0,1` notification
+  (the module's default receive mode). Any other byte, or nothing within 20 s,
+  is a failure.
+- Flow in `main.cpp`: a PULL session finishes, the frame is built with the fresh
+  cell info and signal strength, `modem.requestSend()` queues it (the modem is
+  still in its 5 s linger), and `SEND_DONE` / `SEND_FAILED` comes back. On
+  `SEND_DONE` the readings that were in the frame are removed from the buffer;
+  readings taken during the upload stay. On failure nothing is removed and the
+  next session retries. If the buffer is full during an upload, the sent count is
+  reduced when the oldest reading is dropped.
+- Server host and port come from the `SERVER_IP` / `SERVER_PORT` settings.
+- **Not verified.** Written from knowledge of the A7670E AT manual, not run.
+  Neither the build nor a PC check was possible (PlatformIO would not run on
+  Python 3.14, and is not installed for 3.13). The URC formats are the main risk.
+- **Differences from the old firmware:** the old one read the ack with
+  `AT+CIPRXGET` and kept a retry cache; this uses the unsolicited `+RECEIVE` and
+  simply keeps unsent readings in RAM (lost on reset, no flash cache).
+
+### 2.13 Dev mode
+
+- Normal timing: reading every 5 min, upload every 30 min (open item 10).
+  `set DEV_MODE 1` switches to a reading every 1 min and an upload every 5 min
+  (`DEV_SAMPLE_PERIOD_MS`, `DEV_SESSION_PERIOD_MS` in `config.h`).
+- Not saved to flash, like `LOG`: a reset returns to normal timing, so a unit
+  cannot be left in dev mode in the field by accident. `DEV_MODE_DEFAULT` in
+  `config.h` makes a bench build start in dev mode.
+- Takes effect at once; the next reading / upload is measured from the last one.
+- **Status LED:** in dev mode the dev board's single NeoPixel shows what the
+  firmware is doing (off outside dev mode): white flash 0.3 s = reading taken,
+  steady amber = modem powered, green 2 s = upload acked, red 4 s = session or
+  upload failed, dim blue tick every 2 s = idle. Uses the core's
+  `neopixelWrite()`, no library; brightness is `DEV_LED_LEVEL` (24/255).
+- **Assumption:** the pin is `RGB_BUILTIN` from the board package (GPIO48 on
+  DevKitC-1 v1.0, GPIO38 on v1.1); change `DEV_LED_PIN` in `config.h` if the
+  LED stays dark. The production board has no such LED.
+- Not built or run.
+
+### 2.14 Battery saver
+
+- A low battery stretches both periods: below 30 % (`BATT_LOW_PERCENT`) they are
+  multiplied by 2 (normal: reading every 10 min, upload every 60 min); below
+  15 % (`BATT_CRITICAL_PERCENT`) by 4 (20 min / 120 min). Applies in dev mode
+  too, so it can be tested on the bench.
+- Hysteresis: to leave a level the battery must rise 3 % above its threshold
+  (`BATT_RECOVER_MARGIN`). A level change is logged with the new periods.
+- No fresh battery reading (read failed) keeps the current level; the start
+  level is normal.
+- The battery handler reads about once a minute; the level follows its latest
+  value, and a new period takes effect from the last reading / upload.
+- **Caution:** with no battery connected the reading may be near 0 %, which
+  would put a bench unit in CRITICAL (x4). Battery channel and calibration are
+  still open (item 2).
+- Thresholds and multipliers are guesses, not from the owner or the power
+  budget. Not built or run.
 
 ## 3. Bench results to date
 
@@ -192,7 +278,7 @@ while the battery settles, the ADC converts or the modem boots.
 Those results are from the **earlier blocking version** of the code. Not yet
 run on the board: the non-blocking rewrite, on-demand modem sessions and
 shutdown, cell block, device ID print, settings console, battery, moisture,
-frame builder.
+frame builder, the v2 fields (2.11) and the TCP sender (2.12).
 
 One thing verified on a PC for the rewrite: the date-to-epoch function used for
 GNSS and modem time (`timeutil.h`) matches Python's `calendar.timegm` for six
@@ -207,8 +293,12 @@ dates, including a leap day and the year-2038 boundary.
    connected (hardware.md).
 3. **Moisture calibration:** needs dry and wet voltage readings for each
    sensor; a two-point `set` command could be added.
-4. **TCP sender, ack and retry buffer:** not written. `SERVER_IP` / `SERVER_PORT`
-   are stored but unused.
+4. **TCP sender:** written (2.12) but never built or run. Needs a build, a test
+   against the real server, and a check of the module's reply formats. No
+   persistent retry cache (unsent readings are lost on reset).
+   Also: the APN default is empty; without a working APN `NETOPEN` fails.
+   Also: decide the `signal_strength` value for "unknown" (2.11) and fix the
+   mangled underscores in telemetry.md.
 5. **Run the whole new code on the board.** The non-blocking rewrite, modem
    shutdown (`AT+CPOF`), the cell block and the session timing have only been
    compiled. Check in particular that the SHT30, SCD40 and ADS1115 still read
@@ -222,7 +312,25 @@ dates, including a leap day and the year-2038 boundary.
 9. **Hardcoded values in comments:** code reads everything from `config.h`,
    but several comments quote GPIO numbers and addresses; update them if a pin
    changes.
-10. **Session period.** `MODEM_SESSION_PERIOD_MS` is 2 min for the bench. The
-    field value depends on the power budget and the server's expectations.
+10. **Intervals.** Set by the owner: one reading every 5 min
+    (`TELEMETRY_SAMPLE_PERIOD_MS`) and one upload every 30 min
+    (`MODEM_SESSION_PERIOD_MS`), so about 6 readings per frame (buffer holds 24,
+    about 2 h of offline data). The first upload comes 30 min after boot. Power
+    budget not checked.
 11. The AIN1 drain and the AIN2/AIN3 level (about 0.12 V, stable) are explained
     only as floating inputs; not investigated further.
+
+## Offline resilience (backlog, retry, watchdog)
+
+- **Flash backlog.** Unsent readings survive a reset (`/backlog.bin`, mirror of the
+  24-reading RAM buffer). When RAM is full the oldest reading moves to a flash spill
+  queue (`/spill.bin`, up to `BACKLOG_MAX_READINGS`, default 2016 = 7 days at 5 min)
+  instead of being dropped. Uploads send the spill first, 24 readings per frame; after
+  an ack the next chunk goes out in the same modem session until the backlog is empty.
+  Past the cap the oldest 24 are dropped.
+- **Retry backoff.** A failed session or upload retries after `MODEM_RETRY_BASE_MS`
+  (1 min), doubling each failure (2, 4, 8 ...) up to the normal session period. Any ack
+  resets it.
+- **Watchdog.** Hardware task watchdog on `loop()`, `WDT_TIMEOUT_S` (60 s). A hang
+  resets the chip; the cause appears as the reset-reason byte in the next frame.
+- Not yet tested on hardware.

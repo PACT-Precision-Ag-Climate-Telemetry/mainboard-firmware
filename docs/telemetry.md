@@ -14,16 +14,16 @@ One upload is one binary frame, sent as a single TCP write to port `8080`:
 
 ```text
 +----------+--------------------------+----------------+-----------+-----------+
-|  Header  |  Historical records      |  Newest record | GPS block | Cell block|
-|  14 B    |  (count - 1) x 21 / 25 B |  29 / 33 B     | 8 B, opt. | 4 B, opt. |
-+----------+--------------------------+----------------+-----------+-----------+
+|  Header  |  Historical records      |  Newest record | GPS block | Cell block| Trailer |
+|  14 B    |  (count - 1) x 23 / 27 B |  31 / 35 B     | 8 B, opt. | 4 B, opt. | 2 B     |
++----------+--------------------------+----------------+-----------+-----------+---------+
 ```
 
 - **Byte order:** every multi-byte number is **little-endian**.
 - **Record order:** records go **oldest first**, and the last record is the newest.
 - **What the flags control:** the flags byte in the header decides the length
   of each record (the RAW bit) and whether the GPS and Cell blocks follow.
-- **Record sizes:** "21 / 25" and "29 / 33" mean _without RAW / with RAW_.
+- **Record sizes:** "23 / 27" and "31 / 35" mean _without RAW / with RAW_.
 
 ## 1. Header (14 bytes)
 
@@ -61,22 +61,22 @@ Every record starts with `timedif`. The **newest record** (the last one) also
 carries the absolute `timestamp`. After that comes the sensor body, which is
 the same in every record.
 
-### Historical record: 21 B, or 25 B with RAW
+### Historical record: 23 B, or 27 B with RAW
 
 | Offset | Field       | Type      |
 | -----: | ----------- | --------- |
 |     +0 | timedif     | uint16    |
-|     +2 | sensor body | 19 / 23 B |
+|     +2 | sensor body | 21 / 25 B |
 
-### Newest record: 29 B, or 33 B with RAW
+### Newest record: 31 B, or 35 B with RAW
 
 | Offset | Field       | Type                 |
 | -----: | ----------- | -------------------- |
 |     +0 | timedif     | uint16               |
 |     +2 | timestamp   | uint64, Unix seconds |
-|    +10 | sensor body | 19 / 23 B            |
+|    +10 | sensor body | 21 / 25 B            |
 
-### Sensor body: 19 B, or 23 B with RAW
+### Sensor body: 21 B, or 25 B with RAW
 
 |    Offset | Field              | Type   | Encoding                                                                      |
 | --------: | ------------------ | ------ | ----------------------------------------------------------------------------- |
@@ -89,11 +89,12 @@ the same in every record.
 |       +12 | moisture           | uint16 | % × 100                                                                       |
 |       +14 | battery_percentage | uint16 | % × 100                                                                       |
 |       +16 | battery_voltage    | uint16 | mV                                                                            |
-|       +18 | methane_raw        | uint16 | raw ADC count. **Only if RAW is set**                                         |
-|       +20 | moisture_raw       | uint16 | raw ADC count. **Only if RAW is set**                                         |
-| +18 / +22 | status             | uint8  | Sensor-health bits, see below                                                 |
+|       +18 | esp_temperature    | int16  | ESP die temperature, °C × 100, **signed**. `41.25 °C → 4125`                  |
+|       +20 | methane_raw        | uint16 | methane in %LEL x 100 (1.25 %LEL = 125). **Only if RAW is set**           |
+|       +22 | moisture_raw       | uint16 | raw ADC count. **Only if RAW is set**                                         |
+| +20 / +24 | status             | uint8  | Sensor-health bits, see below                                                 |
 
-If RAW is clear, `status` comes straight after `battery_voltage`, at +18.
+If RAW is clear, `status` comes straight after `esp_temperature`, at +20.
 
 Round to the nearest hundredth before you scale. In C, use
 `(int16_t)lroundf(t * 100)`. A plain cast truncates, so it turns `28.499` into
@@ -152,19 +153,26 @@ These go after the newest record, in this order.
 |     +0 | mobile_country_code | uint16 (e.g. 520 = Thailand) |
 |     +2 | mobile_network_code | uint16. `0` is a valid MNC   |
 
+**Trailer (2 B), always present, always last**
+
+| Offset | Field           | Type  | Encoding                                                                                                                                                                                                                           |
+| -----: | --------------- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+|     +0 | signal_strength | int8  | Cellular RSSI in dBm, signed. `-85 dBm → 0xAB`                                                                                                                                                                                     |
+|     +1 | reset_reason    | uint8 | ESP-IDF `esp_reset_reason_t`: 0 unknown, 1 power*on, 2 external_pin, 3 software, 4 panic, 5 interrupt_watchdog, 6 task_watchdog, 7 other_watchdog, 8 deep_sleep_wake, 9 brownout. Anything higher is published as `unknown*<code>` |
+
 ## 4. Frame size
 
 ```text
-body     = 19 + (RAW ? 4 : 0)
-total    = 14 + (2 + body) × (count − 1) + (10 + body) + (GPS ? 8 : 0) + (CELL ? 4 : 0)
-         = 22 + (2 + body) × count + gps + cell
+body     = 21 + (RAW ? 4 : 0)
+total    = 14 + (2 + body) × (count − 1) + (10 + body) + (GPS ? 8 : 0) + (CELL ? 4 : 0) + 2
+         = 24 + (2 + body) × count + gps + cell
 ```
 
 | count | no extras | RAW | RAW + GPS | RAW + GPS + CELL |
 | ----: | --------: | --: | --------: | ---------------: |
-|     1 |        43 |  47 |        55 |               59 |
-|     3 |        85 |  97 |       105 |              109 |
-|    24 |       526 | 622 |       630 |              634 |
+|     1 |        47 |  51 |        59 |               63 |
+|     3 |        93 | 105 |       113 |              117 |
+|    24 |       576 | 672 |       680 |              684 |
 
 The server reads the 14-byte header first. Then it uses `count` and `flags` to
 work out exactly how many more bytes to read. If the frame is shorter, the read
@@ -178,8 +186,9 @@ is rejected.
 3. For the newest reading, write `timedif`, then the 8-byte `timestamp`, then the sensor body.
 4. If GPS is set, append latitude and longitude.
 5. If CELL is set, append MCC and MNC.
-6. Check the length against the formula in section 4.
-7. Send the frame in one write, then wait for the 1-byte ack `0x00`. Clear the
+6. Append the 2-byte trailer: signal_strength (int8 dBm), then reset_reason (uint8).
+7. Check the length against the formula in section 4.
+8. Send the frame in one write, then wait for the 1-byte ack `0x00`. Clear the
    device buffer only after the ack arrives. No ack means the frame was rejected
    or not published, so keep the buffer and retry on the next upload.
 

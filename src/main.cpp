@@ -1,9 +1,12 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <sys/time.h>
+#include <esp_system.h>  // esp_reset_reason()
+#include <esp_task_wdt.h>
 
 #include "config.h"  // all pins / addresses / bauds / intervals live here
 #include "device_id.h"
+#include "backlog.h"
 #include "field_config.h"
 #include "i2c_tools.h"
 #include "settings.h"
@@ -43,21 +46,65 @@ static bool gSettingsOk = false;
 
 // ---- field configurator ------------------------------------------------------
 static FieldConfig console(Serial);
+static bool gDevMode = cfg::DEV_MODE_DEFAULT;  // "set DEV_MODE 1": faster sample / upload timing
 static bool gLog = true;  // "set LOG 0" silences periodic output while configuring
+
+// Battery saver: 0 = normal, 1 = low, 2 = critical (see config.h). Both periods
+// are stretched at the lower levels. Updated from the latest battery reading
+// with hysteresis; an unknown battery keeps the current level.
+static uint8_t gBattLevel = 0;
+static uint8_t battSlowdown() {
+  return gBattLevel == 2 ? cfg::BATT_CRITICAL_SLOWDOWN : gBattLevel == 1 ? cfg::BATT_LOW_SLOWDOWN : 1;
+}
+static uint32_t samplePeriodMs() {
+  return (gDevMode ? cfg::DEV_SAMPLE_PERIOD_MS : cfg::TELEMETRY_SAMPLE_PERIOD_MS) * battSlowdown();
+}
+static uint32_t sessionPeriodMs() {
+  return (gDevMode ? cfg::DEV_SESSION_PERIOD_MS : cfg::MODEM_SESSION_PERIOD_MS) * battSlowdown();
+}
 
 // ---- telemetry batch ---------------------------------------------------------
 static Telemetry::Reading gReadings[cfg::TELEMETRY_MAX_READINGS];
 static uint8_t gReadingCount = 0;
 static uint32_t gLastSample = 0;
 static uint32_t gLastSession = 0;
-static bool gSendPending = false;  // a modem session was started to send data
+static bool gSendPending = false;  // a modem session / upload is in progress
+static uint8_t gSentCount = 0;     // readings in the frame being uploaded (oldest first)
+static bool gSendFromSpill = false;     // that frame came from the flash spill, not the RAM buffer
+static uint8_t gInflightSpilled = 0;    // readings of the RAM frame that were pushed to flash mid-upload
+static uint8_t gFailCount = 0;          // failed sessions/uploads in a row (drives the retry backoff)
+static Telemetry::Reading gChunk[cfg::TELEMETRY_MAX_READINGS];  // oldest readings loaded from the spill
+static uint8_t gFrame[24 + (2 + 25) * cfg::TELEMETRY_MAX_READINGS + 8 + 4];  // max frame
+static_assert(sizeof(gFrame) <= Modem::MAX_SEND_BYTES, "Modem send buffer too small for max frame");
 
 static void pushReading(const Telemetry::Reading &r) {
-  if (gReadingCount == cfg::TELEMETRY_MAX_READINGS) {  // full: drop the oldest
+  if (gReadingCount == cfg::TELEMETRY_MAX_READINGS) {  // full: move the oldest to flash
+    Backlog::spillAppend(gReadings[0]);
     memmove(&gReadings[0], &gReadings[1], sizeof(Telemetry::Reading) * (gReadingCount - 1));
     gReadingCount--;
+    if (gSendPending && !gSendFromSpill && gSentCount > 0) {
+      gSentCount--;  // the oldest one was in the frame being sent: it is in flash now,
+      gInflightSpilled++;  // so an ack must remove it from there instead
+    }
   }
   gReadings[gReadingCount++] = r;
+}
+
+// Unsent readings anywhere: RAM buffer or flash spill.
+static bool backlogPending() { return gReadingCount > 0 || Backlog::spillCount() > 0; }
+
+// Wait before the next upload attempt: the normal period, or after failures an
+// exponential retry (1, 2, 4, 8 ... min) capped at the normal period.
+static uint32_t nextSessionDelayMs() {
+  const uint32_t period = sessionPeriodMs();
+  if (gFailCount == 0) return period;
+  const uint32_t retry = cfg::MODEM_RETRY_BASE_MS << (gFailCount > 10 ? 9 : gFailCount - 1);
+  return retry < period ? retry : period;
+}
+
+static void noteUploadFailed() {
+  if (gFailCount < 255) gFailCount++;
+  if (gLog) Serial.printf("[Telemetry] retry in %lu s\n", (unsigned long)(nextSessionDelayMs() / 1000));
 }
 
 static bool systemClockSet() { return time(nullptr) > 1700000000; }
@@ -91,7 +138,70 @@ static Telemetry::Location currentLocation() {
     loc.mcc = modem.mcc;
     loc.mnc = modem.mnc;
   }
+  if (modem.csq >= 0 && modem.csq <= 31) loc.signalDbm = (int8_t)(-113 + 2 * modem.csq);
+  loc.resetReason = (uint8_t)esp_reset_reason();
   return loc;
+}
+
+// ---- dev-mode status LED (the single NeoPixel on the dev board) ----------------
+// Only lit in dev mode. Priority: result flash > modem on > reading flash > idle tick.
+//   white flash 0.3 s   a reading was taken
+//   amber steady        modem powered (session / upload running)
+//   green 2 s           upload acked by the server
+//   red 4 s             modem session or upload failed
+//   dim blue tick       idle, alive (50 ms every 2 s)
+static uint32_t gLedFlashUntil = 0;
+static uint8_t gLedFlashR = 0, gLedFlashG = 0, gLedFlashB = 0;
+static uint32_t gLedLast = 0xFFFFFFFF;  // last colour written (0xFFFFFFFF = unknown)
+
+static void ledFlash(uint8_t r, uint8_t g, uint8_t b, uint32_t ms) {
+  if (!gDevMode) return;
+  gLedFlashR = r; gLedFlashG = g; gLedFlashB = b;
+  gLedFlashUntil = millis() + ms;
+}
+
+static void ledShow(uint8_t r, uint8_t g, uint8_t b) {
+  uint32_t c = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  if (c == gLedLast) return;  // write only on change
+  gLedLast = c;
+  neopixelWrite(cfg::DEV_LED_PIN, r, g, b);
+}
+
+// Re-evaluate the battery level (call from loop()).
+static void updateBatteryLevel() {
+  if (!battery.fresh(cfg::PERIOD_BATTERY_MS * 3)) return;
+  const float p = battery.percent;
+  uint8_t level = gBattLevel;
+  if (p < cfg::BATT_CRITICAL_PERCENT) level = 2;
+  else if (p < cfg::BATT_LOW_PERCENT && gBattLevel != 2) level = 1;
+  else if (gBattLevel == 2 && p >= cfg::BATT_CRITICAL_PERCENT + cfg::BATT_RECOVER_MARGIN)
+    level = (p < cfg::BATT_LOW_PERCENT + cfg::BATT_RECOVER_MARGIN) ? 1 : 0;
+  else if (gBattLevel == 1 && p >= cfg::BATT_LOW_PERCENT + cfg::BATT_RECOVER_MARGIN) level = 0;
+  if (level != gBattLevel) {
+    gBattLevel = level;
+    if (gLog) {
+      static const char *names[] = {"normal", "LOW", "CRITICAL"};
+      Serial.printf("[Battery] %.0f%% -> %s: reading every %lu s, upload every %lu s\n", p,
+                    names[level], (unsigned long)(samplePeriodMs() / 1000),
+                    (unsigned long)(sessionPeriodMs() / 1000));
+    }
+  }
+}
+
+static void updateLed(uint32_t now) {
+  const uint8_t L = cfg::DEV_LED_LEVEL;
+  if (!gDevMode) {
+    ledShow(0, 0, 0);
+    gLedFlashUntil = 0;
+    return;
+  }
+  const bool flashing = (int32_t)(gLedFlashUntil - now) > 0;
+  const bool resultFlash = flashing && (gLedFlashR != gLedFlashG || gLedFlashG != gLedFlashB);  // coloured, not white
+  if (resultFlash) ledShow(gLedFlashR, gLedFlashG, gLedFlashB);
+  else if (modem.state() != Modem::State::OFF) ledShow(L, L * 2 / 3, 0);  // amber
+  else if (flashing) ledShow(gLedFlashR, gLedFlashG, gLedFlashB);        // white: reading taken
+  else if (now % 2000 < 50) ledShow(0, 0, L / 3);                         // dim blue tick
+  else ledShow(0, 0, 0);
 }
 
 // Builds one Reading from the latest sensor values. A sensor with no recent
@@ -101,6 +211,7 @@ static Telemetry::Reading collectReading() {
   Reading r;
   r.timestamp = nowEpoch();
   r.offsetMm = currentOffsetMm();  // OFFSET from the field configurator
+  r.espTemperatureC = temperatureRead();  // ESP die temperature
 
   if (sht.fresh(cfg::SENSOR_STALE_MS)) {
     r.temperatureC = sht.temperatureC;
@@ -115,7 +226,7 @@ static Telemetry::Reading collectReading() {
   if (methane.fresh(cfg::SENSOR_STALE_MS) && !isnan(methane.ch4PercentLEL)) {
     float ppm = methane.ch4PercentLEL * cfg::METHANE_PPM_PER_LEL_PERCENT;
     r.methanePpm = (uint16_t)constrain(lroundf(ppm), 0L, 65535L);
-    r.methaneRaw = (uint16_t)constrain(lroundf(methane.ch4PercentLEL), 0L, 65535L);
+    r.methaneRaw = (uint16_t)constrain(lroundf(methane.ch4PercentLEL * 100.0f), 0L, 65535L);  // %LEL x 100
   } else {
     r.status |= Status::METHANE_READ_FAILED;
   }
@@ -153,9 +264,8 @@ static String hexString(const uint8_t *b, size_t n) {
 
 // Frame for the readings collected so far, as hex ("get PAYLOAD_HEX").
 static String payloadHex() {
-  static uint8_t frame[22 + (2 + 23) * cfg::TELEMETRY_MAX_READINGS + 8 + 4];  // max frame
-  size_t n = Telemetry::build(gReadings, gReadingCount, currentLocation(), frame, sizeof(frame));
-  return n ? hexString(frame, n) : String("(no readings yet)");
+  size_t n = Telemetry::build(gReadings, gReadingCount, currentLocation(), gFrame, sizeof(gFrame));
+  return n ? hexString(gFrame, n) : String("(no readings yet)");
 }
 
 // ---- read-only values exposed to the field configurator -----------------------
@@ -169,6 +279,13 @@ static const Binding kLiveBindings[] = {
      +[](const String &v) {
        if (v != "0" && v != "1") return false;
        gLog = (v == "1");
+       return true;
+     }},
+    {"DEV_MODE", "1 = dev timing (reading every 1 min, upload every 5 min), 0 = normal (5 min / 30 min). Not saved; resets at boot",
+     +[]() { return String(gDevMode ? 1 : 0); },
+     +[](const String &v) {
+       if (v != "0" && v != "1") return false;
+       gDevMode = (v == "1");
        return true;
      }},
     {"SHT30_TEMPERATURE", "Air temperature, C", +[]() { return String(sht.temperatureC, 2); }, nullptr},
@@ -252,6 +369,9 @@ void setup() {
   modem.begin();    // modem power off until a session is requested
   modem.setRawSink(&Serial);
 
+  // Readings that were not uploaded before the last reset come back from flash.
+  if (Backlog::begin()) gReadingCount = Backlog::load(gReadings, cfg::TELEMETRY_MAX_READINGS);
+
   // Field configurator: writable settings first, then read-only live values.
   size_t n = 0;
   const Binding *settingBindings = Settings::bindings(n);
@@ -262,6 +382,53 @@ void setup() {
                ? String("OK queued. The modem wakes if needed; the reply is printed when it arrives")
                : String("ERR another AT command is still pending");
   });
+
+  // Hardware watchdog, armed last: the begin() calls above can legitimately take a while.
+  // If loop() stops running for WDT_TIMEOUT_S the chip resets; the cause then shows up
+  // as the reset-reason byte in the next telemetry frame.
+  esp_task_wdt_config_t wdt = {};
+  wdt.timeout_ms = cfg::WDT_TIMEOUT_S * 1000;
+  wdt.idle_core_mask = 0;  // watch only loop(), not the idle tasks
+  wdt.trigger_panic = true;
+  if (esp_task_wdt_init(&wdt) == ESP_ERR_INVALID_STATE) esp_task_wdt_reconfigure(&wdt);
+  esp_task_wdt_add(nullptr);
+}
+
+// Pick the oldest unsent readings (flash spill first, then the RAM buffer), build
+// the frame with the freshest cell info / signal strength and queue the TCP
+// upload. On success a send is pending; false if nothing could be queued.
+static bool queueUpload() {
+  const Telemetry::Reading *src = gReadings;
+  uint8_t cnt = gReadingCount;
+  gSendFromSpill = Backlog::spillCount() > 0;
+  if (gSendFromSpill) {
+    cnt = Backlog::spillPeek(gChunk, cfg::TELEMETRY_MAX_READINGS);
+    src = gChunk;
+    if (cnt == 0) {  // flash read failed: do not get stuck behind it, send the RAM buffer
+      if (gLog) Serial.println("[Telemetry] could not read the flash backlog");
+      gSendFromSpill = false;
+      src = gReadings;
+      cnt = gReadingCount;
+    }
+  }
+  gSentCount = cnt;
+  gInflightSpilled = 0;
+  size_t n = cnt ? Telemetry::build(src, cnt, currentLocation(), gFrame, sizeof(gFrame)) : 0;
+  const Settings::Values &s = Settings::get();
+  if (n == 0 || !modem.requestSend(gFrame, n, s.serverIp, s.serverPort)) {
+    gSentCount = 0;
+    gSendFromSpill = false;
+    if (gLog) Serial.println("[Telemetry] could not queue the frame");
+    return false;
+  }
+  gSendPending = true;
+  if (gLog) {
+    Serial.printf("[Telemetry] sending %u %s reading(s), %u bytes to %s:%u\n", cnt,
+                  gSendFromSpill ? "backlog" : "buffered", (unsigned)n, s.serverIp.c_str(),
+                  (unsigned)s.serverPort);
+    Serial.println(hexString(gFrame, n));
+  }
+  return true;
 }
 
 // Modem session finished: log it, take the network time if our clock is not
@@ -269,7 +436,9 @@ void setup() {
 static void onModemSession(Modem::Event ev) {
   if (ev == Modem::Event::SESSION_FAILED) {
     if (gLog) Serial.printf("[Modem] session failed: %s\n", modem.lastError.c_str());
-    gSendPending = false;  // try again at the next session period
+    if (gSendPending) noteUploadFailed();  // retry sooner than the normal period
+    gSendPending = false;
+    ledFlash(cfg::DEV_LED_LEVEL, 0, 0, 4000);
     return;
   }
 
@@ -280,17 +449,56 @@ static void onModemSession(Modem::Event ev) {
   if (gLog) modem.print(Serial);
 
   if (gSendPending) {
-    gSendPending = false;
-    if (gReadingCount > 0 && gLog) {
-      Serial.printf("[Telemetry] frame ready: %u reading(s), cell block %s\n", gReadingCount,
-                    modem.hasCell ? "yes" : "no");
-      Serial.println(payloadHex());
-      Serial.println("[Telemetry] TCP send is not implemented yet: frame NOT sent");
-    }
+    gSendPending = false;  // queueUpload() sets it again once the frame is queued
+    queueUpload();
+  }
+}
+
+// TCP upload finished. Drop the readings that were sent only if the server acked.
+static void onModemSend(Modem::Event ev) {
+  gSendPending = false;
+  const bool acked = (ev == Modem::Event::SEND_DONE);
+  ledFlash(acked ? 0 : cfg::DEV_LED_LEVEL, acked ? cfg::DEV_LED_LEVEL : 0, 0, acked ? 2000 : 4000);
+
+  if (!acked) {
+    noteUploadFailed();
+    if (gLog)
+      Serial.printf("[Telemetry] send failed: %s (keeping %u buffered + %lu in flash)\n",
+                    modem.lastError.c_str(), gReadingCount, (unsigned long)Backlog::spillCount());
+    gSentCount = 0;
+    gInflightSpilled = 0;
+    gSendFromSpill = false;
+    return;
+  }
+
+  gFailCount = 0;
+  const bool wasSpill = gSendFromSpill;
+  if (wasSpill) {
+    Backlog::spillDrop(gSentCount);  // the oldest chunk, now delivered
+  } else {
+    if (gSentCount > gReadingCount) gSentCount = gReadingCount;
+    memmove(&gReadings[0], &gReadings[gSentCount],
+            sizeof(Telemetry::Reading) * (gReadingCount - gSentCount));
+    gReadingCount -= gSentCount;
+    if (gInflightSpilled) Backlog::spillDrop(gInflightSpilled);  // sent, but had moved to flash
+    Backlog::save(gReadings, gReadingCount);
+  }
+  gSentCount = 0;
+  gInflightSpilled = 0;
+  gSendFromSpill = false;
+  if (gLog)
+    Serial.printf("[Telemetry] server acked, %u reading(s) left in buffer, %lu in flash\n",
+                  gReadingCount, (unsigned long)Backlog::spillCount());
+
+  // Catching up after an outage: send the next chunk in this same modem session
+  // (it is still powered) rather than waiting a whole period. Not on a weak battery.
+  if (wasSpill && gBattLevel < 2 && backlogPending() && !queueUpload()) {
+    gLastSession = millis() - sessionPeriodMs();  // modem busy: upload at the next chance
   }
 }
 
 void loop() {
+  esp_task_wdt_reset();  // proof loop() is still running
   uint32_t now = millis();
 
   if (!gBootReported && now >= cfg::SERIAL_ATTACH_DELAY_MS) {
@@ -317,7 +525,11 @@ void loop() {
     lastModem = modem.state();
     if (gLog) Serial.printf("[Modem] -> %s\n", modem.stateName());
   }
-  if (ev != Modem::Event::NONE) onModemSession(ev);
+  if (ev == Modem::Event::SEND_DONE || ev == Modem::Event::SEND_FAILED) onModemSend(ev);
+  else if (ev != Modem::Event::NONE) onModemSession(ev);
+
+  updateBatteryLevel();
+  updateLed(now);
 
   for (size_t i = 0; i < DEVICE_COUNT; i++) {
     if (devices[i]->poll() && gLog) devices[i]->print(Serial);
@@ -328,18 +540,23 @@ void loop() {
   if (!gBootReported) return;  // timers start after the boot report
 
   // Take a reading and add it to the batch.
-  if (now - gLastSample >= cfg::TELEMETRY_SAMPLE_PERIOD_MS) {
+  if (now - gLastSample >= samplePeriodMs()) {
     gLastSample = now;
     pushReading(collectReading());
+    Backlog::save(gReadings, gReadingCount);  // survives a reset while offline
+    ledFlash(cfg::DEV_LED_LEVEL, cfg::DEV_LED_LEVEL, cfg::DEV_LED_LEVEL, 300);
     if (gLog) Serial.printf("[Telemetry] %u reading(s) buffered, status=0x%02X\n", gReadingCount,
                             gReadings[gReadingCount - 1].status);
   }
 
   // Wake the modem only when there is data to send.
-  if (!gSendPending && !modem.busy() && gReadingCount > 0 &&
-      now - gLastSession >= cfg::MODEM_SESSION_PERIOD_MS) {
+  if (!gSendPending && !modem.busy() && backlogPending() &&
+      now - gLastSession >= nextSessionDelayMs()) {
     gLastSession = now;
     gSendPending = true;
+    gSentCount = 0;
+    gInflightSpilled = 0;
+    gSendFromSpill = false;
     modem.request();
     if (gLog) Serial.println("[Modem] waking to send data");
   }

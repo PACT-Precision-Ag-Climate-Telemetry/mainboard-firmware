@@ -131,6 +131,7 @@ runtime controls, not settings):
 | Name | `set` value | Effect |
 |------|-------------|--------|
 | `LOG` | `0` / `1` | `0` mutes the periodic debug output, `1` brings it back (resets to 1 at boot) |
+| `DEV_MODE` | `0` / `1` | `1` = dev timing: a reading every 1 min and an upload every 5 min. `0` = normal (5 min / 30 min). Not saved, resets to `0` at boot. In dev mode the dev board's NeoPixel shows status (see development-log 2.13) |
 | `MODEM_WAKE` | `1` | Wake the modem now and run a status session (SIM, registration, signal, MCC/MNC, network time). `get MODEM_WAKE` returns the modem state |
 
 ### The modem and the `at` command

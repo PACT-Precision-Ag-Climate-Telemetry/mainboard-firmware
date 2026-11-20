@@ -20,7 +20,7 @@ class SCD40 : public I2CDevice {
   bool service() override;
 
  private:
-  enum class St : uint8_t { STOPPING, IDLE, WAIT_READY, WAIT_DATA };
+  enum class St : uint8_t { STOPPING, ASC_SET, IDLE, WAIT_READY, WAIT_DATA };
   St _st = St::IDLE;
   uint32_t _t = 0;
 };

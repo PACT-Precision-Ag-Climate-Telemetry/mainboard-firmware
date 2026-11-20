@@ -19,6 +19,10 @@
 //   PULL session  SIM state, network registration (waits up to 60 s), signal
 //                 (CSQ), functionality (CFUN), operator -> MCC/MNC for the
 //                 telemetry cell block, and network time (AT+CCLK?)
+//   SEND job      TCP upload of one telemetry frame (docs/telemetry.md):
+//                 NETOPEN, CIPOPEN, CIPSEND, wait for the 1-byte ack 0x00,
+//                 CIPCLOSE, NETCLOSE. Queue with requestSend() after a PULL
+//                 session (the modem lingers MODEM_LINGER_MS for follow-ups).
 //   RAW command   one AT command typed in the field configurator
 //
 // UART: 115200 8N1. Net names are from the MODEM's side, so the ESP transmits
@@ -26,7 +30,8 @@
 class Modem {
  public:
   enum class State : uint8_t { OFF, POWER_SETTLE, KEY_PULSE, BOOT_WAIT, INIT, READY, SHUTDOWN };
-  enum class Event : uint8_t { NONE, SESSION_DONE, SESSION_FAILED };
+  enum class Event : uint8_t { NONE, SESSION_DONE, SESSION_FAILED, SEND_DONE, SEND_FAILED };
+  static constexpr size_t MAX_SEND_BYTES = 768;  // >= largest telemetry frame
 
   Modem(HardwareSerial &port, int pinPwr, int pinEn, int pinModemRxd,
         int pinModemTxd, uint32_t baud = 115200)
@@ -41,13 +46,19 @@ class Modem {
   bool requestRaw(const String &cmd);
   void setRawSink(Print *sink) { _rawSink = sink; }
 
+  // Queue one frame for TCP upload to host:port. The bytes are copied. False if
+  // a send is already queued/running or the frame is empty / too large. The
+  // result arrives as Event::SEND_DONE (server acked 0x00) or SEND_FAILED
+  // (reason in lastError). If the modem was off it is woken first.
+  bool requestSend(const uint8_t *data, size_t len, const String &host, uint16_t port);
+
   // Call every loop(). Returns SESSION_DONE when a PULL session just finished
   // (fresh results below), SESSION_FAILED if the modem could not be started.
   Event service();
 
   State state() const { return _state; }
   const char *stateName() const;
-  bool busy() const { return _state != State::OFF || _sessionRequested || _rawPending; }
+  bool busy() const { return _state != State::OFF || _sessionRequested || _rawPending || _sendRequested; }
   bool registered() const { return creg == 1 || creg == 5 || cereg == 1 || cereg == 5; }
   void print(Print &out) const;
 
@@ -67,16 +78,23 @@ class Modem {
   uint32_t networkTimeAtMs = 0;    // millis() when networkEpoch was read
   String lastError;
   uint32_t sessions = 0;           // completed PULL sessions
+  uint32_t sendsOk = 0;            // frames acked by the server
 
  private:
-  enum class Job : uint8_t { NONE, PULL, RAW };
+  enum class Job : uint8_t { NONE, PULL, RAW, SEND };
+  enum class SendStage : uint8_t { NETOPEN, IPOPEN, IPSEND, DATA, ACK, CIPCLOSE, NETCLOSE };
   enum class Stage : uint8_t { CPIN, CREG, CEREG, REG_WAIT, CSQ, CFUN, COPS, CCLK, DONE };
 
-  void startCmd(const String &cmd, uint32_t timeoutMs);  // send, return immediately
+  // Send `cmd` and return immediately. cmdPoll() then reports success on "OK",
+  // or, if `expect` is set, once `expect` plus `extra` more bytes have arrived.
+  void startCmd(const String &cmd, uint32_t timeoutMs, const char *expect = "", size_t extra = 0);
+  void startData(const uint8_t *d, size_t n, uint32_t timeoutMs, const char *expect);
   int cmdPoll();           // 0 = pending, 1 = OK, -1 = ERROR / timeout / none running
   String initCmd(uint8_t stage) const;
   void runReady(uint32_t now, Event &ev);
   void stepPull(uint32_t now, Event &ev);
+  void stepSend(uint32_t now, Event &ev);
+  void sendFailed(const char *why);
   void parsePull(Stage stage);
   void cutPower();
   void failStart(const char *why, Event &ev);
@@ -91,11 +109,20 @@ class Modem {
   Stage _stage = Stage::CPIN;
   bool _sessionRequested = false;
   bool _rawPending = false;
+  bool _sendRequested = false;
+  SendStage _sendStage = SendStage::NETOPEN;
+  bool _sendOk = false;
+  uint8_t _txBuf[MAX_SEND_BYTES];
+  size_t _txLen = 0;
+  String _sendHost;
+  uint16_t _sendPortNo = 0;
   String _rawCmd;
   Print *_rawSink = nullptr;
 
   // command engine
   String _resp;
+  String _expect;
+  size_t _expectExtra = 0;
   bool _cmdActive = false;
   uint32_t _cmdT0 = 0, _cmdTimeout = 0;
 

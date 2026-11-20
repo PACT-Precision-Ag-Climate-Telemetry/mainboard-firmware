@@ -34,6 +34,7 @@ constexpr uint8_t MOISTURE_READ_FAILED = 1 << 5;
 constexpr size_t HEADER_SIZE = 14;
 constexpr size_t GPS_BLOCK_SIZE = 8;
 constexpr size_t CELL_BLOCK_SIZE = 4;
+constexpr size_t TRAILER_SIZE = 2;  // signal_strength + reset_reason, always present
 
 // One sample, in natural units. Scaling to the wire format happens in build().
 struct Reading {
@@ -47,7 +48,8 @@ struct Reading {
   float moisturePct = 0;
   float batteryPct = 0;
   uint16_t batteryMv = 0;
-  uint16_t methaneRaw = 0;     // only sent when RAW is on
+  float espTemperatureC = 0;   // ESP die temperature
+  uint16_t methaneRaw = 0;     // methane %LEL x 100 (1.25 %LEL = 125); only sent when RAW is on
   uint16_t moistureRaw = 0;    // only sent when RAW is on
   uint8_t status = Status::OK;
 };
@@ -60,6 +62,9 @@ struct Location {
   bool hasCell = false;
   uint16_t mcc = 0;
   uint16_t mnc = 0;
+  // Trailer fields (always sent).
+  int8_t signalDbm = 0;      // cellular RSSI in dBm; 0 = unknown
+  uint8_t resetReason = 0;   // esp_reset_reason_t
 };
 
 // The OFFSET setting rounded to the wire type (uint16, clamped).
