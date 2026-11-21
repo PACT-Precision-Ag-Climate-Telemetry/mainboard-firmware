@@ -3,7 +3,7 @@
 #include "../config.h"
 #include "i2c_device.h"
 
-// ST VL53L1X time-of-flight distance sensor, address 0x29.
+// ST VL53L1X time-of-flight distance sensor, address 0x29. Single-shot mode.
 class VL53L1XTof : public I2CDevice {
  public:
   VL53L1XTof() : I2CDevice("VL53L1X", cfg::ADDR_VL53L1X, cfg::PERIOD_VL53L1X_MS) {}
@@ -15,7 +15,9 @@ class VL53L1XTof : public I2CDevice {
  protected:
   bool init() override;
   bool update() override;
+  void restart() override { _measuring = false; }
 
  private:
   VL53L1X _sensor;
+  bool _measuring = false;  // a single-shot ranging is running
 };

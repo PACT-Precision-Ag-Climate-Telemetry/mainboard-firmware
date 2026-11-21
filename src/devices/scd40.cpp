@@ -2,6 +2,7 @@
 
 static const uint16_t CMD_STOP_PERIODIC = 0x3F86;
 static const uint16_t CMD_START_PERIODIC = 0x21B1;
+static const uint16_t CMD_SINGLE_SHOT = 0x219D;  // SCD41 only
 static const uint16_t CMD_SET_ASC = 0x2416;  // automatic self-calibration on/off
 static const uint16_t CMD_GET_DATA_READY = 0xE4B8;
 static const uint16_t CMD_READ_MEASUREMENT = 0xEC05;
@@ -10,13 +11,17 @@ static const uint32_t CMD_MS = 2;     // execution time of the 1 ms commands
 
 bool SCD40::init() {
   writeCmd16(CMD_STOP_PERIODIC);  // harmless if not running
-  _st = St::STOPPING;             // service() starts periodic mode in 500 ms
+  _st = St::STOPPING;             // stays stopped; a measurement window starts it
   _t = millis();
   return true;
 }
 
+void SCD40::restart() {
+  if (_st == St::WAIT_READY || _st == St::WAIT_DATA) _st = St::IDLE;
+}
+
 bool SCD40::update() {
-  if (_st != St::IDLE) return false;
+  if (!_wantRun || !_running || _st != St::IDLE) return false;
   if (!writeCmd16(CMD_GET_DATA_READY)) return false;
   _st = St::WAIT_READY;
   _t = millis();
@@ -43,9 +48,27 @@ bool SCD40::service() {
       return false;
 
     case St::ASC_SET:
-      if (now - _t >= CMD_MS) {
-        writeCmd16(CMD_START_PERIODIC);
-        _st = St::IDLE;
+      if (now - _t >= CMD_MS) _st = St::IDLE;  // stays stopped until a window opens
+      return false;
+
+    case St::STOP_WAIT:
+      if (now - _t >= STOP_MS) _st = St::IDLE;
+      return false;
+
+    case St::IDLE:
+      if (_wantRun && !_running) {
+        // SCD41: one measurement (ready in ~5 s), the sensor then sleeps by itself.
+        // SCD40: periodic mode, stopped again once the window is over.
+        if (writeCmd16(cfg::CO2_SENSOR_IS_SCD41 ? CMD_SINGLE_SHOT : CMD_START_PERIODIC)) _running = true;
+      } else if (!_wantRun && _running) {
+        if (cfg::CO2_SENSOR_IS_SCD41) {
+          _running = false;
+        } else {
+          writeCmd16(CMD_STOP_PERIODIC);  // got what we needed: back to idle
+          _running = false;
+          _st = St::STOP_WAIT;
+          _t = now;
+        }
       }
       return false;
 

@@ -4,6 +4,10 @@
 #include "../timeutil.h"
 
 static const size_t MAX_RESPONSE = 512;
+// The server's ack. This A7670E reports received TCP data as
+//   "RECV FROM:<ip>:<port>\r\n+IPD<len>\r\n<data>"
+// so a 1-byte reply is "+IPD1\r\n" followed by the byte, which must be 0x00.
+static const char ACK_TAG[] = "+IPD1\r\n";
 static const uint8_t INIT_STAGE_MODEL = 2;  // index of AT+CGMM in initCmd()
 
 void Modem::begin() {
@@ -91,7 +95,10 @@ String Modem::initCmd(uint8_t stage) const {
     case 2: return "AT+CGMM";          // model
     case 3: return "AT+CTZU=1";        // network time update
     case 4: return "AT+COPS=3,2";      // operator reported as numeric MCC+MNC
-    case 5: {
+    // Received TCP data is pushed to the UART (the upload's ack wait relies on that),
+    // not held in the module for AT+CIPRXGET.
+    case 5: return "AT+CIPRXGET=0";
+    case 6: {
       const String &apn = Settings::get().apn;
       if (apn.length() == 0) return "";
       return "AT+CGDCONT=1,\"IP\",\"" + apn + "\"";
@@ -114,6 +121,7 @@ void Modem::failStart(const char *why, Event &ev) {
   cutPower();
   _state = State::OFF;
   _sessionRequested = false;
+  _hold = false;  // do not retry endlessly; hold again to retry
   if (_rawPending) {
     _rawPending = false;
     if (_rawSink) _rawSink->printf("\r\n[at] ERR modem did not start (%s)\r\n", why);
@@ -129,7 +137,7 @@ Modem::Event Modem::service() {
 
   switch (_state) {
     case State::OFF:
-      if (_sessionRequested || _rawPending || _sendRequested) {
+      if (_sessionRequested || _rawPending || _sendRequested || _hold) {
         _port.end();
         _port.begin(_baud, SERIAL_8N1, /*rx*/ _pinTxd, /*tx*/ _pinRxd);
         digitalWrite(_pinPwr, HIGH);  // MOSFET on: modem gets its 5 V rail
@@ -223,7 +231,18 @@ void Modem::runReady(uint32_t now, Event &ev) {
     if (_rawPending) {
       _rawPending = false;
       _job = Job::RAW;
-      startCmd(_rawCmd, cfg::MODEM_RAW_TIMEOUT_MS);
+      // These commands answer "OK" at once and report the real result later in a
+      // "+XXX:" line, so wait for that line instead of stopping at the first OK.
+      String u = _rawCmd;
+      u.trim();
+      u.toUpperCase();
+      const char *expect = "";
+      uint32_t timeout = cfg::MODEM_RAW_TIMEOUT_MS;
+      if (u.startsWith("AT+NETOPEN")) { expect = "+NETOPEN:"; timeout = 20000; }
+      else if (u.startsWith("AT+CIPOPEN")) { expect = "+CIPOPEN:"; timeout = 30000; }
+      else if (u.startsWith("AT+NETCLOSE")) { expect = "+NETCLOSE:"; timeout = 10000; }
+      else if (u.startsWith("AT+CIPCLOSE")) { expect = "+CIPCLOSE:"; timeout = 10000; }
+      startCmd(_rawCmd, timeout, expect);
     } else if (_sendRequested) {
       _sendRequested = false;
       _job = Job::SEND;
@@ -236,7 +255,7 @@ void Modem::runReady(uint32_t now, Event &ev) {
       _stage = Stage::CPIN;
       _jobT0 = now;
       _cmdActive = false;
-    } else if (now - _lastActivity >= cfg::MODEM_LINGER_MS) {
+    } else if (!_hold && now - _lastActivity >= cfg::MODEM_LINGER_MS) {
       _shutdownStarted = false;
       _state = State::SHUTDOWN;
     }
@@ -274,7 +293,10 @@ bool Modem::requestSend(const uint8_t *data, size_t len, const String &host, uin
 
 // Remember the first failure and jump to cleanup (close the socket / network).
 void Modem::sendFailed(const char *why) {
-  if (_sendOk) lastError = why;
+  if (_sendOk) {
+    lastError = why;
+    lastRx = _resp;  // what the modem said before the failure, for diagnosis
+  }
   _sendOk = false;
   _sendStage = SendStage::CIPCLOSE;
   _cmdActive = false;
@@ -293,8 +315,7 @@ void Modem::stepSend(uint32_t now, Event &ev) {
         break;
       case SendStage::IPSEND: startCmd("AT+CIPSEND=0," + String((unsigned)_txLen), 5000, ">"); break;
       case SendStage::DATA: startData(_txBuf, _txLen, 15000, "+CIPSEND:"); break;
-      // Server ack: "+RECEIVE,0,1\r\n" followed by one byte that must be 0x00.
-      case SendStage::ACK: startCmd("", 20000, "+RECEIVE,0,1\r\n", 1); break;
+      case SendStage::ACK: startCmd("", 20000, ACK_TAG, 1); break;
       case SendStage::CIPCLOSE: startCmd("AT+CIPCLOSE=0", 5000, "+CIPCLOSE:"); break;
       case SendStage::NETCLOSE: startCmd("AT+NETCLOSE", 5000, "+NETCLOSE:"); break;
     }
@@ -320,12 +341,22 @@ void Modem::stepSend(uint32_t now, Event &ev) {
       else sendFailed("modem refused CIPSEND");
       break;
     case SendStage::DATA:
-      if (r == 1 && _resp.indexOf("+CIPSEND: 0,") >= 0) _sendStage = SendStage::ACK;
-      else sendFailed("frame write failed");
+      if (r == 1 && _resp.indexOf("+CIPSEND: 0,") >= 0) {
+        // Keep what has been received so far: a fast server's reply may already be
+        // in it. Carry straight on into the ack wait without flushing the buffer.
+        _expect = ACK_TAG;
+        _expectExtra = 1;
+        _cmdT0 = now;
+        _cmdTimeout = 20000;
+        _cmdActive = true;
+        _sendStage = SendStage::ACK;
+      } else {
+        sendFailed("frame write failed");
+      }
       break;
     case SendStage::ACK: {
-      int i = _resp.indexOf("+RECEIVE,0,1\r\n");
-      if (r == 1 && i >= 0 && _resp.charAt(i + 14) == 0) {
+      int i = _resp.indexOf(ACK_TAG);
+      if (r == 1 && i >= 0 && _resp.charAt(i + sizeof(ACK_TAG) - 1) == 0) {
         _sendStage = SendStage::CIPCLOSE;  // success: _sendOk stays true
       } else if (r == 1) {
         sendFailed("server rejected the frame (no 0x00 ack)");
@@ -349,6 +380,10 @@ void Modem::stepSend(uint32_t now, Event &ev) {
 
 // ---- PULL session -----------------------------------------------------------
 void Modem::stepPull(uint32_t now, Event &ev) {
+  if (_stage == Stage::SIM_WAIT) {  // SIM still starting up: ask again shortly
+    if (now - _stageT >= cfg::MODEM_SIM_POLL_MS) _stage = Stage::CPIN;
+    return;
+  }
   if (_stage == Stage::REG_WAIT) {  // waiting between registration checks
     if (now - _stageT >= cfg::MODEM_REGISTER_POLL_MS) _stage = Stage::CREG;
     return;
@@ -381,8 +416,15 @@ void Modem::stepPull(uint32_t now, Event &ev) {
 
   switch (_stage) {
     case Stage::CPIN:
-      // No point waiting for the network without a SIM.
-      _stage = simReady ? Stage::CREG : Stage::CSQ;
+      if (simReady) {
+        _stage = Stage::CREG;
+      } else if (now - _jobT0 < cfg::MODEM_SIM_WAIT_MS) {
+        // Right after power-up the SIM is still initialising: keep asking for a while.
+        _stageT = now;
+        _stage = Stage::SIM_WAIT;
+      } else {
+        _stage = Stage::CSQ;  // no SIM after waiting: no point waiting for the network
+      }
       break;
     case Stage::CREG: _stage = Stage::CEREG; break;
     case Stage::CEREG:

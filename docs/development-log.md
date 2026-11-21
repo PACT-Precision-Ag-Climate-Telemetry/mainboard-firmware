@@ -207,9 +207,11 @@ while the battery settles, the ADC converts or the modem boots.
   (`+CIPOPEN: 0,0`), `AT+CIPSEND=0,len` (wait for `>`), the frame bytes in one
   write (`+CIPSEND:`), then the ack, then `AT+CIPCLOSE=0` and `AT+NETCLOSE`.
   Cleanup runs after a failure too.
-- Ack: the server's 1-byte `0x00` is read from the `+RECEIVE,0,1` notification
-  (the module's default receive mode). Any other byte, or nothing within 20 s,
-  is a failure.
+- Ack: the server's 1-byte `0x00` is read from the `+IPD1` notification. Verified
+  on the A7670E-LASE: received data arrives as `RECV FROM:<ip>:<port>`, `+IPD<len>`,
+  then the data bytes (not `+RECEIVE,<link>,<len>`, which this firmware first
+  assumed and which never matched). Any other byte, or nothing within 20 s, is a
+  failure.
 - Flow in `main.cpp`: a PULL session finishes, the frame is built with the fresh
   cell info and signal strength, `modem.requestSend()` queues it (the modem is
   still in its 5 s linger), and `SEND_DONE` / `SEND_FAILED` comes back. On

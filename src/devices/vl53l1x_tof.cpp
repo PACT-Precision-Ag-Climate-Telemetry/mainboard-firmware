@@ -10,12 +10,19 @@ bool VL53L1XTof::init() {
   _sensor.setROICenter(199);
   _sensor.setDistanceMode(VL53L1X::Long);
   _sensor.setMeasurementTimingBudget(50000);  // 50 ms
-  _sensor.startContinuous(50);
+  // Single-shot: nothing runs until update() starts one measurement.
+  _sensor.stopContinuous();
   return true;
 }
 
 bool VL53L1XTof::update() {
-  if (!_sensor.dataReady()) return false;
+  if (!_measuring) {
+    _sensor.readSingle(false);  // start one ranging, do not wait
+    _measuring = true;
+    return false;
+  }
+  if (!_sensor.dataReady()) return false;  // asked again on the next period
+  _measuring = false;
   distanceMm = _sensor.read(false);
   rangeValid = (_sensor.ranging_data.range_status == VL53L1X::RangeValid);
   return true;

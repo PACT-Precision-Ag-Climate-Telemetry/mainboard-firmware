@@ -3,6 +3,7 @@
 #include <sys/time.h>
 #include <esp_system.h>  // esp_reset_reason()
 #include <esp_task_wdt.h>
+#include <LittleFS.h>
 
 #include "config.h"  // all pins / addresses / bauds / intervals live here
 #include "device_id.h"
@@ -164,7 +165,7 @@ static void ledShow(uint8_t r, uint8_t g, uint8_t b) {
   uint32_t c = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
   if (c == gLedLast) return;  // write only on change
   gLedLast = c;
-  neopixelWrite(cfg::DEV_LED_PIN, r, g, b);
+  rgbLedWrite(cfg::DEV_LED_PIN, r, g, b);
 }
 
 // Re-evaluate the battery level (call from loop()).
@@ -251,6 +252,114 @@ static Telemetry::Reading collectReading() {
   return r;
 }
 
+// ---- sensor measurement window -------------------------------------------------
+// Sensors are not polled continuously. A window opens when a telemetry sample is
+// due (or on demand from the configurator), every sensor is kicked once, and the
+// window closes when all of them delivered a new value or after
+// SENSOR_WINDOW_TIMEOUT_MS. A window opened for a sample then stores the reading.
+static bool gMeasuring = false;
+static bool gSampleWanted = false;   // store a reading when the window closes
+static uint32_t gMeasureStart = 0;
+// Per-sensor progress inside one window. A sensor is "settled" once it delivered a
+// value or used up SENSOR_MAX_ATTEMPTS tries; an attempt that gets no result within
+// the sensor's attempt timeout is restarted.
+struct Progress {
+  bool got = false;
+  uint8_t attempts = 0;
+  uint32_t attemptStart = 0;
+};
+static Progress gProg[DEVICE_COUNT];
+static Progress gBattProg, gMoistProg;
+static const uint32_t kBattAttemptMs = cfg::BATTERY_SETTLE_MS + cfg::BATTERY_ADC_TIMEOUT_MS + 1000;
+
+static void startMeasure(bool forSample) {
+  if (forSample) gSampleWanted = true;
+  if (gMeasuring) return;
+  gMeasuring = true;
+  gMeasureStart = millis();
+  const uint32_t now = gMeasureStart;
+  for (size_t i = 0; i < DEVICE_COUNT; i++) {
+    gProg[i] = Progress{false, 1, now};
+    devices[i]->windowStart();
+    devices[i]->kick();
+  }
+  gBattProg = gMoistProg = Progress{false, 1, now};
+  battery.request();
+  moisture.request();
+}
+
+// Poll the sensors while a window is open and retry the ones that do not answer.
+// The battery and moisture handlers (and any device that is still busy, such as the
+// SCD40 being stopped) keep being polled after the window closed: the battery
+// reading switches BATT_SENSE_EN / SOLAR_DIS and must always finish and restore
+// them, which needs the ADS1115 polled too.
+static void pollSensors(uint32_t now) {
+  const bool adcNeeded = battery.busy() || moisture.busy();
+  for (size_t i = 0; i < DEVICE_COUNT; i++) {
+    I2CDevice *d = devices[i];
+    if (!gMeasuring && !d->busy() && !(d == &adc && adcNeeded)) continue;
+    if (d->poll()) {
+      gProg[i].got = true;
+      if (gLog) d->print(Serial);
+    }
+    // No result within this sensor's attempt timeout: try again.
+    if (gMeasuring && d->ok() && !gProg[i].got && gProg[i].attempts < cfg::SENSOR_MAX_ATTEMPTS &&
+        now - gProg[i].attemptStart >= d->attemptTimeoutMs()) {
+      gProg[i].attempts++;
+      gProg[i].attemptStart = now;
+      d->kick();
+      if (gLog) Serial.printf("[%s] no reading, retry %u/%u\n", d->name(), gProg[i].attempts,
+                              (unsigned)cfg::SENSOR_MAX_ATTEMPTS);
+    }
+  }
+
+  if (gMeasuring || battery.busy()) {
+    if (battery.poll()) {
+      gBattProg.got = true;
+      if (gLog) battery.print(Serial);
+    }
+    if (gMeasuring && adc.ok() && !gBattProg.got && !battery.busy() &&
+        gBattProg.attempts < cfg::SENSOR_MAX_ATTEMPTS && now - gBattProg.attemptStart >= kBattAttemptMs) {
+      gBattProg.attempts++;
+      gBattProg.attemptStart = now;
+      battery.request();
+      if (gLog) Serial.printf("[Battery] no reading, retry %u/%u\n", gBattProg.attempts,
+                              (unsigned)cfg::SENSOR_MAX_ATTEMPTS);
+    }
+  }
+  if (gMeasuring || moisture.busy()) {
+    if (moisture.poll()) {
+      gMoistProg.got = true;
+      if (gLog) moisture.print(Serial);
+    }
+    if (gMeasuring && adc.ok() && !gMoistProg.got && !moisture.busy() &&
+        gMoistProg.attempts < cfg::SENSOR_MAX_ATTEMPTS &&
+        now - gMoistProg.attemptStart >= cfg::SENSOR_ATTEMPT_TIMEOUT_MS) {
+      gMoistProg.attempts++;
+      gMoistProg.attemptStart = now;
+      moisture.request();
+      if (gLog) Serial.printf("[Moisture] no reading, retry %u/%u\n", gMoistProg.attempts,
+                              (unsigned)cfg::SENSOR_MAX_ATTEMPTS);
+    }
+  }
+}
+
+// A sensor is settled once it has a value, or its last attempt has timed out.
+static bool settled(const Progress &p, uint32_t attemptMs, uint32_t now) {
+  return p.got || (p.attempts >= cfg::SENSOR_MAX_ATTEMPTS && now - p.attemptStart >= attemptMs);
+}
+
+// True when every working sensor is settled, or the hard timeout passed.
+static bool measureDone(uint32_t now) {
+  if (now - gMeasureStart >= cfg::SENSOR_WINDOW_TIMEOUT_MS) return true;
+  for (size_t i = 0; i < DEVICE_COUNT; i++)
+    if (devices[i]->ok() && !settled(gProg[i], devices[i]->attemptTimeoutMs(), now)) return false;
+  if (adc.ok() && (!settled(gBattProg, kBattAttemptMs, now) ||
+                   !settled(gMoistProg, cfg::SENSOR_ATTEMPT_TIMEOUT_MS, now)))
+    return false;
+  return true;
+}
+
 static String hexString(const uint8_t *b, size_t n) {
   static const char *H = "0123456789abcdef";
   String s;
@@ -274,6 +383,49 @@ static String ageText(uint32_t ms) { return " (age " + String(ms / 1000) + " s)"
 static const Binding kLiveBindings[] = {
     {"ID", "Device ID (model + serial from the MAC)", +[]() { return getDeviceIdString(); }, nullptr},
     {"FW_VERSION", "Firmware version", +[]() { return String(cfg::FW_VERSION); }, nullptr},
+    {"ESP_CHIP", "Chip model, revision, cores",
+     +[]() -> String {
+       return String(ESP.getChipModel()) + " rev " + String(ESP.getChipRevision()) + ", " +
+              String(ESP.getChipCores()) + " cores";
+     }, nullptr},
+    {"ESP_CPU_MHZ", "CPU frequency, MHz", +[]() -> String { return String(ESP.getCpuFreqMHz()); }, nullptr},
+    {"ESP_MAC", "Base MAC address",
+     +[]() -> String {
+       char b[18];
+       uint64_t m = ESP.getEfuseMac();  // low 6 bytes, first octet in the lowest byte
+       snprintf(b, sizeof(b), "%02X:%02X:%02X:%02X:%02X:%02X", (uint8_t)m, (uint8_t)(m >> 8),
+                (uint8_t)(m >> 16), (uint8_t)(m >> 24), (uint8_t)(m >> 32), (uint8_t)(m >> 40));
+       return String(b);
+     }, nullptr},
+    {"ESP_SDK", "ESP-IDF / Arduino core version",
+     +[]() -> String { return String(ESP.getSdkVersion()) + " / " + String(ESP_ARDUINO_VERSION_MAJOR) + "." +
+                    String(ESP_ARDUINO_VERSION_MINOR) + "." + String(ESP_ARDUINO_VERSION_PATCH); },
+     nullptr},
+    {"ESP_UPTIME", "Time since boot, seconds", +[]() -> String { return String(millis() / 1000); }, nullptr},
+    {"ESP_RESET_REASON", "Why the chip last reset (power-on, software, panic, watchdog, brownout...)",
+     +[]() -> String {
+       static const char *names[] = {"unknown", "power-on", "external pin", "software", "panic",
+                                     "interrupt watchdog", "task watchdog", "other watchdog",
+                                     "deep sleep wake", "brownout", "SDIO", "USB", "JTAG", "eFuse",
+                                     "power glitch", "CPU lockup"};
+       uint8_t r = (uint8_t)esp_reset_reason();
+       return String(r < sizeof(names) / sizeof(names[0]) ? names[r] : "?") + " (" + String(r) + ")";
+     }, nullptr},
+    {"ESP_TEMPERATURE", "ESP die temperature, C", +[]() -> String { return String(temperatureRead(), 1); }, nullptr},
+    {"ESP_HEAP", "Heap: free / minimum ever free / total, bytes",
+     +[]() -> String {
+       return String(ESP.getFreeHeap()) + " / " + String(ESP.getMinFreeHeap()) + " / " +
+              String(ESP.getHeapSize());
+     }, nullptr},
+    {"ESP_PSRAM", "PSRAM: free / total, bytes (0 / 0 = none found)",
+     +[]() -> String { return String(ESP.getFreePsram()) + " / " + String(ESP.getPsramSize()); }, nullptr},
+    {"ESP_FLASH", "Flash chip size, bytes and speed MHz",
+     +[]() -> String { return String(ESP.getFlashChipSize()) + " B @ " + String(ESP.getFlashChipSpeed() / 1000000) + " MHz"; },
+     nullptr},
+    {"ESP_FS", "Flash filesystem (LittleFS): used / total bytes",
+     +[]() -> String { return String(LittleFS.usedBytes()) + " / " + String(LittleFS.totalBytes()); }, nullptr},
+    {"BACKLOG", "Unsent readings: in RAM buffer / in flash",
+     +[]() -> String { return String(gReadingCount) + " / " + String(Backlog::spillCount()); }, nullptr},
     {"LOG", "1 = periodic debug output on, 0 = off (not saved; resets at boot)",
      +[]() { return String(gLog ? 1 : 0); },
      +[](const String &v) {
@@ -293,9 +445,16 @@ static const Binding kLiveBindings[] = {
     {"CO2_PPM", "SCD40 CO2, ppm", +[]() { return String(co2.co2ppm); }, nullptr},
     {"METHANE_LEL", "Methane, percent of lower explosive limit", +[]() { return String(methane.ch4PercentLEL, 2); }, nullptr},
     {"DISTANCE_MM", "VL53L1X distance, mm (sent as depth)", +[]() { return String(tof.distanceMm); }, nullptr},
+    {"MEASURE", "set 1 = read all sensors now (sensors are otherwise read only once per sample period). Reads back 1 while measuring",
+     +[]() { return String(gMeasuring ? 1 : 0); },
+     +[](const String &v) {
+       if (v != "1") return false;
+       startMeasure(false);
+       return true;
+     }},
     {"MOISTURE_PERCENT", "Soil moisture, percent 0-100. Returns the last reading and starts a new one",
      +[]() {
-       moisture.request();
+       startMeasure(false);
        return moisture.hasReading() ? String(moisture.percent, 1) + ageText(moisture.ageMs())
                                     : String("no reading yet");
      }, nullptr},
@@ -305,7 +464,7 @@ static const Binding kLiveBindings[] = {
      +[]() { return String(moisture.raw); }, nullptr},
     {"BATTERY_MV", "Battery voltage, mV. Returns the last reading and starts a new one (about 5 s)",
      +[]() {
-       battery.request();
+       startMeasure(false);
        return battery.hasReading() ? String(battery.millivolts) + ageText(battery.ageMs())
                                    : String("no reading yet (measuring, takes about 5 s)");
      }, nullptr},
@@ -324,6 +483,13 @@ static const Binding kLiveBindings[] = {
      +[](const String &v) {
        if (v != "1") return false;
        modem.request();
+       return true;
+     }},
+    {"MODEM_HOLD", "1 = wake the modem and keep it powered until set to 0 (then it powers down). Not saved; resets at boot",
+     +[]() -> String { return String(modem.held() ? 1 : 0) + " (" + modem.stateName() + ")"; },
+     +[](const String &v) {
+       if (v != "0" && v != "1") return false;
+       modem.hold(v == "1");
        return true;
      }},
     {"MODEM_CELL", "Cell MCC,MNC from the last session, or 'unknown'",
@@ -465,6 +631,15 @@ static void onModemSend(Modem::Event ev) {
     if (gLog)
       Serial.printf("[Telemetry] send failed: %s (keeping %u buffered + %lu in flash)\n",
                     modem.lastError.c_str(), gReadingCount, (unsigned long)Backlog::spillCount());
+    if (gLog && modem.lastRx.length()) {
+      Serial.print("[Modem] received before the failure: ");
+      for (size_t i = 0; i < modem.lastRx.length(); i++) {
+        const uint8_t c = (uint8_t)modem.lastRx[i];
+        if (c >= 0x20 && c < 0x7F) Serial.print((char)c);
+        else Serial.printf("<%02X>", c);  // CR/LF and binary bytes shown in hex
+      }
+      Serial.println();
+    }
     gSentCount = 0;
     gInflightSpilled = 0;
     gSendFromSpill = false;
@@ -531,26 +706,32 @@ void loop() {
   updateBatteryLevel();
   updateLed(now);
 
-  for (size_t i = 0; i < DEVICE_COUNT; i++) {
-    if (devices[i]->poll() && gLog) devices[i]->print(Serial);
-  }
-  if (battery.poll() && gLog) battery.print(Serial);
-  if (moisture.poll() && gLog) moisture.print(Serial);
-
   if (!gBootReported) return;  // timers start after the boot report
 
-  // Take a reading and add it to the batch.
-  if (now - gLastSample >= samplePeriodMs()) {
+  // Open a measurement window when a sample is due, and poll the sensors only
+  // while it is open.
+  if (!gMeasuring && now - gLastSample >= samplePeriodMs()) {
     gLastSample = now;
-    pushReading(collectReading());
-    Backlog::save(gReadings, gReadingCount);  // survives a reset while offline
-    ledFlash(cfg::DEV_LED_LEVEL, cfg::DEV_LED_LEVEL, cfg::DEV_LED_LEVEL, 300);
-    if (gLog) Serial.printf("[Telemetry] %u reading(s) buffered, status=0x%02X\n", gReadingCount,
-                            gReadings[gReadingCount - 1].status);
+    startMeasure(true);
+  }
+  pollSensors(now);
+
+  // Window finished: take the reading and add it to the batch.
+  if (gMeasuring && measureDone(now)) {
+    gMeasuring = false;
+    for (size_t i = 0; i < DEVICE_COUNT; i++) devices[i]->windowEnd();
+    if (gSampleWanted) {
+      gSampleWanted = false;
+      pushReading(collectReading());
+      Backlog::save(gReadings, gReadingCount);  // survives a reset while offline
+      ledFlash(cfg::DEV_LED_LEVEL, cfg::DEV_LED_LEVEL, cfg::DEV_LED_LEVEL, 300);
+      if (gLog) Serial.printf("[Telemetry] %u reading(s) buffered, status=0x%02X\n", gReadingCount,
+                              gReadings[gReadingCount - 1].status);
+    }
   }
 
   // Wake the modem only when there is data to send.
-  if (!gSendPending && !modem.busy() && backlogPending() &&
+  if (!gSendPending && (!modem.busy() || modem.idleHeld()) && backlogPending() &&
       now - gLastSession >= nextSessionDelayMs()) {
     gLastSession = now;
     gSendPending = true;

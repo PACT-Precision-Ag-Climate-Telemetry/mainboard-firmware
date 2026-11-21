@@ -41,6 +41,24 @@ bool parseU(const String &s, unsigned long lo, unsigned long hi, unsigned long &
   return true;
 }
 
+// One byte as hex: "1A", "0x1A" or "0X1a" (always hex, never decimal).
+bool parseHexByte(const String &s, uint8_t &out) {
+  String t = s;
+  t.trim();
+  if (t.startsWith("0x") || t.startsWith("0X")) t = t.substring(2);
+  if (t.length() == 0 || t.length() > 2) return false;
+  for (size_t i = 0; i < t.length(); i++)
+    if (!isxdigit((unsigned char)t[i])) return false;
+  out = (uint8_t)strtoul(t.c_str(), nullptr, 16);
+  return true;
+}
+
+String hexByte(uint8_t v) {
+  char b[5];
+  snprintf(b, sizeof(b), "0x%02X", v);
+  return String(b);
+}
+
 bool parseF(const String &s, float lo, float hi, float &out) {
   String t = s;
   t.trim();
@@ -78,19 +96,19 @@ bool setServerPort(const String &v) {
 }
 
 // ---- telemetry header ------------------------------------------------------
-String getMagic1() { return String(g.magicByte1); }
+String getMagic1() { return hexByte(g.magicByte1); }
 bool setMagic1(const String &v) {
-  unsigned long n;
-  if (!parseU(v, 0, 255, n) || !saveU(K_MAGIC1, n)) return false;
-  g.magicByte1 = (uint8_t)n;
+  uint8_t n;
+  if (!parseHexByte(v, n) || !saveU(K_MAGIC1, n)) return false;
+  g.magicByte1 = n;
   return true;
 }
 
-String getMagic2() { return String(g.magicByte2); }
+String getMagic2() { return hexByte(g.magicByte2); }
 bool setMagic2(const String &v) {
-  unsigned long n;
-  if (!parseU(v, 0, 255, n) || !saveU(K_MAGIC2, n)) return false;
-  g.magicByte2 = (uint8_t)n;
+  uint8_t n;
+  if (!parseHexByte(v, n) || !saveU(K_MAGIC2, n)) return false;
+  g.magicByte2 = n;
   return true;
 }
 
@@ -142,8 +160,8 @@ bool setApn(const String &v) {
 // ---- defaults, as the strings "set" would take ------------------------------
 String defServerIp() { return cfg::DEFAULT_SERVER_IP; }
 String defServerPort() { return String(cfg::DEFAULT_SERVER_PORT); }
-String defMagic1() { return String(cfg::DEFAULT_MAGIC_BYTE_1); }
-String defMagic2() { return String(cfg::DEFAULT_MAGIC_BYTE_2); }
+String defMagic1() { return hexByte(cfg::DEFAULT_MAGIC_BYTE_1); }
+String defMagic2() { return hexByte(cfg::DEFAULT_MAGIC_BYTE_2); }
 String defRaw() { return String(cfg::DEFAULT_TELEMETRY_RAW ? 1 : 0); }
 String defOffset() { return String(cfg::DEFAULT_OFFSET_MM, 6); }
 String defSlope() { return String(cfg::DEFAULT_MOISTURE_SLOPE, 6); }
@@ -163,8 +181,8 @@ struct Entry {
 const Entry kEntries[] = {
     {{"SERVER_IP", "Telemetry server IPv4 address or hostname", getServerIp, setServerIp}, defServerIp},
     {{"SERVER_PORT", "Telemetry server TCP port (1-65535)", getServerPort, setServerPort}, defServerPort},
-    {{"TELEMETRY_MAGIC_BYTE_1", "Frame magic byte 1, 0-255 (must match server)", getMagic1, setMagic1}, defMagic1},
-    {{"TELEMETRY_MAGIC_BYTE_2", "Frame magic byte 2, 0-255 (must match server)", getMagic2, setMagic2}, defMagic2},
+    {{"TELEMETRY_MAGIC_BYTE_1", "Frame magic byte 1, hex 00-FF e.g. 1A (must match server)", getMagic1, setMagic1}, defMagic1},
+    {{"TELEMETRY_MAGIC_BYTE_2", "Frame magic byte 2, hex 00-FF e.g. 2B (must match server)", getMagic2, setMagic2}, defMagic2},
     {{"TELEMETRY_RAW", "1 = send methane_raw + moisture_raw in each record (RAW flag), 0 = omit", getRaw, setRaw}, defRaw},
     {{"OFFSET", "Telemetry 'offset' field in mm (0-65535), set per installation", getOffset, setOffset}, defOffset},
     {{"ULTRASONIC_OFFSET", "Old name of OFFSET (same value)", getOffset, setOffset}, defOffset},

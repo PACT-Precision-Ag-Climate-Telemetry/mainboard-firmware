@@ -4,7 +4,9 @@
 #include "i2c_device.h"
 
 // DFRobot MH-Z9041A laser methane sensor (SEN0654), address 0x34.
-// The sensor's dip switch must be on the I2C side.
+// The sensor's dip switch must be on the I2C side. The library has no sleep or
+// single-shot command: the sensor measures on its own and passive mode only reads
+// the latest value on request, which is what the measurement window does.
 class MethaneMHZ9041A : public I2CDevice {
  public:
   MethaneMHZ9041A()

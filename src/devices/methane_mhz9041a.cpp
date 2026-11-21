@@ -10,7 +10,7 @@ bool MethaneMHZ9041A::update() {
   ch4PercentLEL = _ch4.getCH4Concentration();
   temperatureC = _ch4.getTemperature();
   errorCode = (int)_ch4.getErrorMsg();
-  return true;
+  return !isnan(ch4PercentLEL);  // NaN = failed read, retried by the window logic
 }
 
 void MethaneMHZ9041A::print(Print &out) const {

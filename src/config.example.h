@@ -36,7 +36,18 @@ constexpr uint32_t PERIOD_VL53L1X_MS = 500;
 constexpr uint32_t PERIOD_MHZ9041A_MS = 1000;
 constexpr uint32_t PERIOD_SHT30_MS = 2000;
 constexpr uint32_t PERIOD_ADS1115_MS = 1000;
+// CO2 sensor on J1: false = SCD40 (no single-shot command, so it is started in
+// periodic mode, read once, then stopped), true = SCD41 (native single-shot).
+constexpr bool CO2_SENSOR_IS_SCD41 = false;
 constexpr uint32_t PERIOD_SCD40_MS = 1000;  // new data only every ~5 s
+// Sensors are read only inside a measurement window that opens when a telemetry
+// sample is due (TELEMETRY_SAMPLE_PERIOD_MS). Within it, the PERIOD_*_MS values
+// above are just the retry interval. The window closes when every sensor has
+// delivered a new value or used up its attempts. A sensor that has not answered
+// within its attempt timeout is restarted, up to SENSOR_MAX_ATTEMPTS times.
+constexpr uint32_t SENSOR_WINDOW_TIMEOUT_MS = 30000;  // hard cap for the whole window
+constexpr uint8_t SENSOR_MAX_ATTEMPTS = 3;            // tries per sensor in one window
+constexpr uint32_t SENSOR_ATTEMPT_TIMEOUT_MS = 2000;  // one try without a result, then retry
 
 // ---- GNSS receiver (J8, UART1, NMEA) -----------------------------------------
 // Net names are from the GNSS module's side: the ESP transmits on GNSS_RXD
@@ -63,6 +74,8 @@ constexpr uint32_t MODEM_AT_RETRY_MS = 300;        // between "AT" probes while 
 // pull status / cell info / network time) and powered down again afterwards.
 constexpr uint32_t MODEM_LINGER_MS = 5000;         // stay on after the last job, for follow-ups
 constexpr uint32_t MODEM_REGISTER_TIMEOUT_MS = 60000;  // give up waiting for the network
+constexpr uint32_t MODEM_SIM_WAIT_MS = 15000;      // keep asking AT+CPIN? this long after power-up
+constexpr uint32_t MODEM_SIM_POLL_MS = 1000;       // between SIM checks
 constexpr uint32_t MODEM_REGISTER_POLL_MS = 2000;  // between registration checks
 constexpr uint32_t MODEM_SHUTDOWN_WAIT_MS = 3000;  // for AT+CPOF to answer
 constexpr uint32_t MODEM_RAW_TIMEOUT_MS = 5000;    // console "at" command
@@ -142,6 +155,6 @@ constexpr float BATTERY_V_FULL = 12.85f;   // 100 % resting voltage
 constexpr float BATTERY_V_EMPTY = 11.50f;  // 0 % resting voltage
 constexpr float BATTERY_LOAD_COMP_V = 0.03f;  // compensation for sensor load
 // A sensor reading older than this counts as failed in the status byte.
-constexpr uint32_t SENSOR_STALE_MS = 15000;
+constexpr uint32_t SENSOR_STALE_MS = 35000;  // must exceed SENSOR_WINDOW_TIMEOUT_MS, but stay below the sample period
 
 }  // namespace cfg

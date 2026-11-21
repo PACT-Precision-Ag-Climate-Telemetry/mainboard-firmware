@@ -41,6 +41,12 @@ class Modem {
   void begin();                         // MODEM_PWR LOW (modem off), EN released
 
   void request() { _sessionRequested = true; }   // wake and run a PULL session
+  // Keep the modem powered: wakes it if it is off and stops it from powering down
+  // after its last job, until hold(false). Cleared if the modem fails to start.
+  void hold(bool on) { _hold = on; if (!on) _lastActivity = millis(); }
+  bool held() const { return _hold; }
+  // Held, powered and doing nothing: it can take a new job right away.
+  bool idleHeld() const { return _hold && _state == State::READY && _job == Job::NONE; }
   // Queue one AT command; its reply is printed to the raw sink when it
   // finishes. False if a raw command is already pending.
   bool requestRaw(const String &cmd);
@@ -77,13 +83,14 @@ class Modem {
   uint64_t networkEpoch = 0;       // Unix seconds, from AT+CCLK? (UTC)
   uint32_t networkTimeAtMs = 0;    // millis() when networkEpoch was read
   String lastError;
+  String lastRx;                   // raw bytes the modem sent during the failed step of the last upload
   uint32_t sessions = 0;           // completed PULL sessions
   uint32_t sendsOk = 0;            // frames acked by the server
 
  private:
   enum class Job : uint8_t { NONE, PULL, RAW, SEND };
   enum class SendStage : uint8_t { NETOPEN, IPOPEN, IPSEND, DATA, ACK, CIPCLOSE, NETCLOSE };
-  enum class Stage : uint8_t { CPIN, CREG, CEREG, REG_WAIT, CSQ, CFUN, COPS, CCLK, DONE };
+  enum class Stage : uint8_t { CPIN, SIM_WAIT, CREG, CEREG, REG_WAIT, CSQ, CFUN, COPS, CCLK, DONE };
 
   // Send `cmd` and return immediately. cmdPoll() then reports success on "OK",
   // or, if `expect` is set, once `expect` plus `extra` more bytes have arrived.
@@ -108,6 +115,7 @@ class Modem {
   Job _job = Job::NONE;
   Stage _stage = Stage::CPIN;
   bool _sessionRequested = false;
+  bool _hold = false;
   bool _rawPending = false;
   bool _sendRequested = false;
   SendStage _sendStage = SendStage::NETOPEN;

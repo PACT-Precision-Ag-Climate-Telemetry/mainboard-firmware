@@ -87,8 +87,8 @@ IP, offset or calibration keeps them after flashing this firmware.
 |------|----------------|---------|--------|
 | `SERVER_IP` | IPv4 address or hostname, up to 253 chars, no spaces or `/` | `103.99.11.209` | Telemetry server address |
 | `SERVER_PORT` | integer 1 to 65535 | `46096` | Telemetry server TCP port |
-| `TELEMETRY_MAGIC_BYTE_1` | integer 0 to 255 (`0x1A` also accepted) | `26` (`0x1A`) | First magic byte of every frame. Must match the server's `magic_byte_1` |
-| `TELEMETRY_MAGIC_BYTE_2` | integer 0 to 255 | `43` (`0x2B`) | Second magic byte. Must match the server's `magic_byte_2` |
+| `TELEMETRY_MAGIC_BYTE_1` | hex byte `00` to `FF`, with or without `0x` (`1A`, `0x1a`) | `0x1A` | First magic byte of every frame. Must match the server's `magic_byte_1` |
+| `TELEMETRY_MAGIC_BYTE_2` | hex byte `00` to `FF`, with or without `0x` | `0x2B` | Second magic byte. Must match the server's `magic_byte_2` |
 | `TELEMETRY_RAW` | `1`/`0` (also `true`/`false`, `on`/`off`) | `1` | `1` sets the RAW flag, so each record also carries `methane_raw` and `moisture_raw` (+4 bytes per record). `0` omits them |
 | `OFFSET` | number 0 to 65535 (mm) | `0` | The `offset` field of every telemetry record. Set it per installation (see section 5) |
 | `ULTRASONIC_OFFSET` | same as `OFFSET` | | Old name of `OFFSET`. Reads and writes the same value |
@@ -109,6 +109,20 @@ firmware has no TCP sender yet, so nothing connects to that address.
 |------|-------|
 | `ID` | Device ID, `TES-MBO-xxxx` (model plus 4 base-62 characters from the MAC) |
 | `FW_VERSION` | Firmware version |
+| `ESP_CHIP` | Chip model, revision and core count, e.g. `ESP32-S3 rev 0, 2 cores` |
+| `ESP_CPU_MHZ` | CPU frequency, MHz |
+| `ESP_MAC` | Base MAC address |
+| `ESP_SDK` | ESP-IDF version / Arduino core version |
+| `ESP_UPTIME` | Seconds since boot |
+| `ESP_RESET_REASON` | Why the chip last reset: power-on, software, panic, task watchdog, brownout, and so on |
+| `ESP_TEMPERATURE` | ESP die temperature, degrees C |
+| `ESP_HEAP` | Heap bytes: free / lowest free since boot / total |
+| `ESP_PSRAM` | PSRAM bytes: free / total (`0 / 0` if none is found) |
+| `ESP_FLASH` | Flash chip size in bytes and speed |
+| `ESP_FS` | LittleFS bytes: used / total |
+| `BACKLOG` | Unsent readings: in the RAM buffer / in the flash backlog |
+| `MODEM_HOLD` | `set MODEM_HOLD 1` wakes the modem and keeps it powered until `set MODEM_HOLD 0`, which lets it power down. Not saved; a reset clears it. Reads back `1 (state)` |
+| `MEASURE` | `set MEASURE 1` reads all sensors now. Sensors are otherwise read only once per sample period, so the sensor values below are stale between readings. Reads back `1` while measuring |
 | `SHT30_TEMPERATURE` | Air temperature, degrees C |
 | `SHT30_HUMIDITY` | Relative humidity, percent |
 | `CO2_PPM` | SCD40 CO2, ppm |

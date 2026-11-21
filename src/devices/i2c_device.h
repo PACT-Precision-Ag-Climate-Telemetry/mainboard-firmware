@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include <Wire.h>
+#include "../config.h"
 
 // Base class for every I2C device handler. Nothing here blocks.
 //   begin()  -> checks the device ACKs, then runs init()
@@ -39,6 +40,23 @@ class I2CDevice {
     return fresh;
   }
 
+  // Start (or restart, for a retry) one measurement attempt: the next poll()
+  // runs update() right away instead of waiting for the period.
+  void kick() {
+    restart();
+    _started = false;
+  }
+
+  // Measurement window hooks. Sensors are single-shot: they only measure while
+  // a window is open (see main.cpp). windowStart() wakes / starts the sensor,
+  // windowEnd() lets it go idle again. busy() is true while the handler still
+  // needs poll() after the window closed (e.g. to stop a sensor cleanly).
+  virtual void windowStart() {}
+  virtual void windowEnd() {}
+  virtual bool busy() const { return false; }
+  // How long one attempt may take before main.cpp retries it.
+  virtual uint32_t attemptTimeoutMs() const { return cfg::SENSOR_ATTEMPT_TIMEOUT_MS; }
+
   virtual void print(Print &out) const = 0;
 
   // True if a valid reading arrived within the last maxAgeMs.
@@ -58,6 +76,8 @@ class I2CDevice {
   // Called on every poll(). Finish pending work. True if it stored a fresh,
   // valid reading.
   virtual bool service() { return false; }
+  // Drop any half-finished attempt so update() can start a fresh one.
+  virtual void restart() {}
 
   bool probe() {
     Wire.beginTransmission(_addr);
